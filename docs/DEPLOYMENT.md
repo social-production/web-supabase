@@ -31,8 +31,28 @@ git push -u origin main
 | `SUPABASE_PROJECT_REF` | Hosted project ref (`https://<ref>.supabase.co`) |
 | `SUPABASE_ANON_KEY` | Hosted **JWT** anon key (`eyJ…`) |
 
-4. Create a GitHub Environment named `hosted` (used by `.github/workflows/deploy.yml`). Optionally require reviewers before production deploys.
+4. Create a GitHub Environment named `hosted` (used by `.github/workflows/deploy.yml`).  
+   **Important:** put the three secrets on that **Environment** (Settings → Environments → `hosted`), not only as repository secrets — the deploy job reads `environment: hosted`.
 5. Create the hosted Supabase project and configure Auth **Site URL** / **Redirect URLs** for the frontend origin (see [HOSTED.md](./HOSTED.md)).
+
+## Keep frontend auto-updated (Vercel)
+
+The public site is Vercel (`social-production-web`). Link it to GitHub once:
+
+1. Open [Vercel Dashboard](https://vercel.com/dashboard) → project `social-production-web`
+2. **Settings → Git** → Connect → `social-production/web` (install the Vercel GitHub App on the org if prompted)
+3. Confirm Production Branch = `main`
+4. **Settings → Environment Variables** (Production) must include:
+
+```bash
+VITE_BACKEND=supabase
+VITE_SUPABASE_URL=https://YOUR_REF.supabase.co
+VITE_SUPABASE_ANON_KEY=eyJ_YOUR_HOSTED_ANON_KEY
+VITE_SUPABASE_FUNCTIONS_URL=https://YOUR_REF.supabase.co/functions/v1
+VITE_USE_DEV_PROXY=false
+```
+
+After that, every push to `web` `main` rebuilds https://social-production-web.vercel.app automatically.
 
 ## What auto-deploys on `main`
 

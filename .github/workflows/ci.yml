@@ -54,10 +54,14 @@ jobs:
             echo "SUPABASE_URL=${API_URL}"
             echo "SUPABASE_ANON_KEY=${ANON_KEY}"
             echo "SUPABASE_SERVICE_ROLE_KEY=${SERVICE_ROLE_KEY}"
+            # functions serve skips SUPABASE_* from --env-file; SB_* aliases are accepted by shared client.
+            echo "SB_URL=${API_URL}"
+            echo "SB_ANON_KEY=${ANON_KEY}"
+            echo "SB_SERVICE_ROLE_KEY=${SERVICE_ROLE_KEY}"
           } > .env.local
           echo "SUPABASE_URL=${API_URL}" >> "$GITHUB_ENV"
           echo "SUPABASE_ANON_KEY=${ANON_KEY}" >> "$GITHUB_ENV"
-          echo "VITE_SUPABASE_FUNCTIONS_URL=${API_URL}/functions/v1" >> "$GITHUB_ENV"
+          echo "VITE_SUPABASE_FUNCTIONS_URL=${FUNCTIONS_URL:-${API_URL}/functions/v1}" >> "$GITHUB_ENV"
 
       - name: Apply migrations
         run: npx --yes supabase@latest db reset
@@ -70,10 +74,15 @@ jobs:
 
       - name: Wait for gateway healthz
         run: |
-          for i in $(seq 1 60); do
-            if curl -fsS "${VITE_SUPABASE_FUNCTIONS_URL}/gateway/healthz" >/dev/null; then
-              echo "gateway ready"
-              exit 0
+          set -euo pipefail
+          for i in $(seq 1 90); do
+            if curl -fsS "${VITE_SUPABASE_FUNCTIONS_URL}/gateway/healthz" -o /tmp/healthz.json; then
+              if python3 -c "import json; assert json.load(open('/tmp/healthz.json')).get('ok') is True"; then
+                # Brief settle so the first smoke curl does not race serve startup.
+                sleep 2
+                echo "gateway ready (attempt ${i})"
+                exit 0
+              fi
             fi
             sleep 2
           done
@@ -82,4 +91,12 @@ jobs:
           exit 1
 
       - name: Smoke
-        run: npm run smoke
+        run: |
+          set -euo pipefail
+          npm run smoke || {
+            echo "==== gateway.log ===="
+            tail -n 300 /tmp/gateway.log || true
+            echo "==== healthz ===="
+            curl -sS -D- "${VITE_SUPABASE_FUNCTIONS_URL}/gateway/healthz" || true
+            exit 1
+          }

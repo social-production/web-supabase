@@ -35,9 +35,19 @@ auth_hdr=(-H "apikey: ${ANON_KEY}" -H "Authorization: Bearer ${ANON_KEY}")
 pass() { echo "  ok: $1"; }
 
 echo "== health =="
-curl -fsS "${auth_hdr[@]}" "${FUNCTIONS_URL}/gateway/healthz" >/tmp/sp-health.json
-python3 -c "import json; assert json.load(open('/tmp/sp-health.json')).get('ok') is True"
-pass health
+for i in $(seq 1 30); do
+  if curl -fsS "${auth_hdr[@]}" "${FUNCTIONS_URL}/gateway/healthz" >/tmp/sp-health.json \
+    && python3 -c "import json; assert json.load(open('/tmp/sp-health.json')).get('ok') is True"; then
+    pass health
+    break
+  fi
+  if [[ "$i" -eq 30 ]]; then
+    echo "healthz failed after retries; FUNCTIONS_URL=${FUNCTIONS_URL}"
+    cat /tmp/sp-health.json 2>/dev/null || true
+    exit 1
+  fi
+  sleep 1
+done
 
 echo "== anonymous bootstrap + feeds =="
 curl -fsS "${auth_hdr[@]}" "${FUNCTIONS_URL}/gateway/bootstrap" >/tmp/sp-bootstrap.json

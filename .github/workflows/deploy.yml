@@ -38,7 +38,11 @@ jobs:
           SUPABASE_ANON_KEY: ${{ secrets.SUPABASE_ANON_KEY }}
         run: |
           if [[ -z "${SUPABASE_ACCESS_TOKEN}" || -z "${PROJECT_REF}" || -z "${SUPABASE_ANON_KEY}" ]]; then
-            echo "Missing required secrets: SUPABASE_ACCESS_TOKEN, SUPABASE_PROJECT_REF, SUPABASE_ANON_KEY"
+            echo "::error::Missing GitHub Environment secrets for 'hosted'."
+            echo "Add these under Settings → Environments → hosted → Environment secrets:"
+            echo "  SUPABASE_ACCESS_TOKEN  (Account → Access Tokens → sbp_…)"
+            echo "  SUPABASE_PROJECT_REF   (from https://<ref>.supabase.co)"
+            echo "  SUPABASE_ANON_KEY      (Project Settings → API → legacy JWT anon eyJ…)"
             exit 1
           fi
           npm run hosted:rehearsal
