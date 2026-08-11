@@ -3,7 +3,6 @@ import {
   handleAddComment,
   handleBootstrap,
   handleBootstrapSummary,
-  handleFeedback,
   handleFollowRequests,
   handleGetComments,
   handleGetSettings,
@@ -1070,11 +1069,6 @@ Deno.serve(async (req) => {
         precision: data.precision,
         isOnline: data.is_online
       });
-    }
-
-    // Feedback
-    if (req.method === 'POST' && path === '/feedback') {
-      return json(await handleFeedback(db, userId, await readJson()));
     }
 
     // Onboarding — AppAdapter shape (matches FastAPI bootstrap/onboarding)

@@ -53,6 +53,5 @@ A Supabase backend is ready for frontend `status: ready` only when it can:
 | `src/users` | `domains/users.ts` | `/users/*` |
 | `src/search` | `domains/search.ts` | `/search` |
 | `src/locations` | `domains/locations.ts` | `/locations/*` |
-| `src/feedback` | `domains/feedback.ts` | `/feedback` |
 
 Validate with `web` contract tests and local smoke (`npm run start` + `functions:serve` + `VITE_BACKEND=supabase`).

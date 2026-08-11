@@ -631,24 +631,6 @@ export async function handleScope(
   };
 }
 
-export async function handleFeedback(
-  db: SupabaseClient,
-  userId: string | null,
-  body: { category: string; body: string; title?: string }
-) {
-  const { data, error } = await db
-    .from('feedback_submissions')
-    .insert({
-      user_id: userId,
-      category: body.category,
-      body: `${body.title ? body.title + '\n\n' : ''}${body.body}`
-    })
-    .select('id')
-    .single();
-  if (error) throw error;
-  return { ok: true, id: data.id };
-}
-
 export async function handleGetSettings(db: SupabaseClient, userId: string) {
   const viewer = await loadViewer(db, userId);
   if (!viewer) return null;
