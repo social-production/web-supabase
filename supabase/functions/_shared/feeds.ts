@@ -520,9 +520,9 @@ async function collectCandidates(
       let q = db
         .from('help_requests')
         .select(
-          'id, title, body, author_id, location_label, location_id, schedule_label, needed_at, vote_count, comment_count, created_at, last_activity_at, moderation_state, users!fk_help_requests_author_id_users(username)'
+          'id, title, body, author_id, location_label, location_id, schedule_label, needed_at, vote_count, comment_count, created_at, moderation_state, users!fk_help_requests_author_id_users(username)'
         )
-        .order('last_activity_at', { ascending: false })
+        .order('created_at', { ascending: false })
         .limit(fetchLimit);
       if (opts.authorId) q = q.eq('author_id', opts.authorId);
       if (opts.authorIds) q = q.in('author_id', opts.authorIds);

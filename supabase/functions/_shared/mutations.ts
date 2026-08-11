@@ -1125,13 +1125,42 @@ export async function markLinkedChatRead(
 }
 
 export async function acceptFollowRequest(db: SupabaseClient, userId: string, username: string) {
-  const { data: follower } = await db.from('users').select('id').eq('username', username).maybeSingle();
+  const { data: follower } = await db.from('users').select('id, username').eq('username', username).maybeSingle();
   if (!follower) throw new Error('not_found');
-  await db
+  const { data: updated, error } = await db
     .from('user_follows')
     .update({ status: 'accepted' })
     .eq('follower_id', follower.id)
-    .eq('followed_id', userId);
+    .eq('followed_id', userId)
+    .eq('status', 'pending')
+    .select('follower_id')
+    .maybeSingle();
+  if (error) throw error;
+  if (!updated) throw new Error('not_found');
+
+  const { data: accepter } = await db.from('users').select('username').eq('id', userId).maybeSingle();
+  const accepterUsername = accepter?.username ?? 'someone';
+  await db.from('notifications').insert({
+    recipient_id: follower.id,
+    actor_id: userId,
+    kind: 'follow-accepted',
+    surface: 'profile',
+    subject_type: 'user',
+    subject_id: userId,
+    target_id: follower.id,
+    title: 'Follow request accepted',
+    body: `@${accepterUsername} accepted your follow request.`,
+    href: `/profile/${accepterUsername}`,
+    is_unread: true
+  });
+  // Mark any pending follow-request notification as read for the accepter.
+  await db
+    .from('notifications')
+    .update({ is_unread: false, read_at: new Date().toISOString() })
+    .eq('recipient_id', userId)
+    .eq('actor_id', follower.id)
+    .eq('kind', 'follow-request')
+    .eq('is_unread', true);
   return { ok: true };
 }
 

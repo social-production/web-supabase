@@ -307,6 +307,37 @@ Deno.serve(async (req) => {
         followed_id: target.id,
         status
       });
+      const { data: actor } = await db.from('users').select('username').eq('id', userId).maybeSingle();
+      const actorUsername = actor?.username ?? 'someone';
+      if (status === 'pending') {
+        await db.from('notifications').insert({
+          recipient_id: target.id,
+          actor_id: userId,
+          kind: 'follow-request',
+          surface: 'profile',
+          subject_type: 'user',
+          subject_id: userId,
+          target_id: target.id,
+          title: 'Follow request',
+          body: `@${actorUsername} requested to follow you.`,
+          href: `/profile/${actorUsername}`,
+          is_unread: true
+        });
+      } else {
+        await db.from('notifications').insert({
+          recipient_id: target.id,
+          actor_id: userId,
+          kind: 'new-follower',
+          surface: 'profile',
+          subject_type: 'user',
+          subject_id: userId,
+          target_id: target.id,
+          title: 'New follower',
+          body: `@${actorUsername} started following you.`,
+          href: `/profile/${actorUsername}`,
+          is_unread: true
+        });
+      }
       return json({ ok: true, following: status === 'accepted', followStatus: status, username });
     }
     if (req.method === 'DELETE' && path.match(/^\/users\/[^/]+\/follow$/)) {
@@ -340,6 +371,15 @@ Deno.serve(async (req) => {
           .from('conversation_members')
           .select('user_id, users!fk_conversation_members_user_id_users(id, username, profile_image_url)')
           .eq('conversation_id', conversation.id);
+        const participants = (members ?? []).map((m) => {
+          const u = Array.isArray(m.users) ? m.users[0] : m.users;
+          return {
+            id: u?.id ?? m.user_id,
+            username: u?.username ?? 'unknown',
+            profileImageUrl: u?.profile_image_url ?? null
+          };
+        });
+        const participantById = new Map(participants.map((p) => [p.id, p]));
         const { data: msgs } = await db
           .from('messages')
           .select('id, sender_id, encrypted_body, created_at, moderation_state')
@@ -349,26 +389,26 @@ Deno.serve(async (req) => {
         conversations.push({
           id: conversation.id,
           kind: conversation.kind,
-          title: conversation.title,
-          participants: (members ?? []).map((m) => {
-            const u = Array.isArray(m.users) ? m.users[0] : m.users;
-            return {
-              id: u?.id ?? m.user_id,
-              username: u?.username ?? 'unknown',
-              profileImageUrl: u?.profile_image_url ?? null
-            };
-          }),
+          title: conversation.title ?? '',
+          participants,
           preview: msgs?.at(-1)?.encrypted_body ?? '',
           lastMessageAt: conversation.last_message_at ?? conversation.created_at,
           unreadCount: 0,
-          messages: (msgs ?? []).map((m) => ({
-            id: m.id,
-            sender: m.sender_id,
-            body: m.encrypted_body,
-            createdAt: m.created_at,
-            isOwn: m.sender_id === userId,
-            moderationState: m.moderation_state ?? 'visible'
-          }))
+          messages: (msgs ?? []).map((m) => {
+            const sender = participantById.get(m.sender_id) ?? {
+              id: m.sender_id,
+              username: 'unknown',
+              profileImageUrl: null
+            };
+            return {
+              id: m.id,
+              sender,
+              body: m.encrypted_body,
+              createdAt: m.created_at,
+              isOwn: m.sender_id === userId,
+              moderationState: m.moderation_state ?? 'visible'
+            };
+          })
         });
       }
       return json({
@@ -895,7 +935,8 @@ Deno.serve(async (req) => {
           location_id: body.locationId ?? body.location_id ?? null,
           schedule_label: body.scheduleLabel ?? body.schedule_label ?? '',
           needed_at: neededAt,
-          ends_at: body.endsAt ?? body.ends_at ?? null
+          ends_at: body.endsAt ?? body.ends_at ?? null,
+          last_activity_at: new Date().toISOString()
         })
         .select('id')
         .single();
