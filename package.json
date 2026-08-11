@@ -1,0 +1,32 @@
+{
+  "name": "web-supabase",
+  "private": true,
+  "version": "0.1.0",
+  "description": "Supabase backend for Social Production — Auth, Postgres, RLS, Edge Functions",
+  "type": "module",
+  "scripts": {
+    "supabase": "npx --yes supabase@latest",
+    "start": "npx --yes supabase@latest start",
+    "stop": "npx --yes supabase@latest stop",
+    "stop:clean": "npx --yes supabase@latest stop --no-backup",
+    "status": "npx --yes supabase@latest status",
+    "status:pretty": "npx --yes supabase@latest status -o pretty",
+    "status:env": "npx --yes supabase@latest status -o env",
+    "db:reset": "npx --yes supabase@latest db reset",
+    "db:lint": "npx --yes supabase@latest db lint",
+    "functions:serve": "npx --yes supabase@latest functions serve --env-file ./.env.local",
+    "seed": "node ./scripts/seed.mjs",
+    "smoke": "bash ./scripts/smoke.sh",
+    "hosted:rehearsal": "bash ./scripts/hosted-rehearsal.sh",
+    "check:structure": "node ./scripts/check-structure.mjs",
+    "test": "vitest run",
+    "docs": "echo 'See README.md and docs/'"
+  },
+  "engines": {
+    "node": ">=20"
+  },
+  "devDependencies": {
+    "supabase": "^2.26.0",
+    "vitest": "^4.1.10"
+  }
+}
