@@ -40,12 +40,21 @@ npx --yes supabase@latest db push --linked
 echo "== deploy gateway =="
 npx --yes supabase@latest functions deploy gateway --project-ref "$PROJECT_REF"
 
-echo "== hosted smoke =="
-SUPABASE_URL="$HOSTED_URL" \
-SUPABASE_ANON_KEY="$ANON_KEY" \
-VITE_SUPABASE_FUNCTIONS_URL="${HOSTED_URL}/functions/v1" \
-npm run smoke
+# Hosted smoke creates disposable users/content. Keep production/beta clean by default.
+# Opt in with HOSTED_SMOKE=1 when you explicitly want a cloud dress rehearsal.
+if [[ "${HOSTED_SMOKE:-0}" == "1" ]]; then
+  echo "== hosted smoke (HOSTED_SMOKE=1) =="
+  SUPABASE_URL="$HOSTED_URL" \
+  SUPABASE_ANON_KEY="$ANON_KEY" \
+  VITE_SUPABASE_FUNCTIONS_URL="${HOSTED_URL}/functions/v1" \
+  npm run smoke
+  echo "Hosted rehearsal smoke OK."
+else
+  echo "== skip hosted smoke =="
+  echo "Deploy finished without smoke so beta data stays clean."
+  echo "CI still runs full local smoke. To run hosted smoke deliberately:"
+  echo "  HOSTED_SMOKE=1 npm run hosted:rehearsal"
+fi
 
-echo "Hosted rehearsal smoke OK."
 echo "Next: set Auth Site URL / Redirect URLs for the frontend origin, then walk docs/SIGNOFF.md Hosted row."
 echo "Cutover checklist: docs/CUTOVER.md"

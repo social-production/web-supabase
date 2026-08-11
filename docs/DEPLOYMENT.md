@@ -60,9 +60,12 @@ After that, every push to `web` `main` rebuilds https://social-production-web.ve
 
 1. Structure check + unit tests
 2. `supabase link` → `db push` → `functions deploy gateway`
-3. Hosted `npm run smoke` against the cloud gateway
 
-[`.github/workflows/ci.yml`](../.github/workflows/ci.yml) also runs structure/unit/local smoke on PRs and pushes.
+Hosted smoke is **off by default** so production/beta data is not polluted. CI still runs full local smoke. For an intentional hosted dress rehearsal:
+
+```bash
+HOSTED_SMOKE=1 npm run hosted:rehearsal
+```
 
 ## Frontend production build against Supabase
 

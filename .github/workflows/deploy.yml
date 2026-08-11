@@ -46,3 +46,4 @@ jobs:
             exit 1
           fi
           npm run hosted:rehearsal
+          # Do not set HOSTED_SMOKE=1 here — smoke seeds disposable data into the live project.
