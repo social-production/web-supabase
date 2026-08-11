@@ -34,7 +34,7 @@ if (!url || !serviceKey) {
   process.exit(1);
 }
 
-const email = process.env.SEED_EMAIL ?? 'demo@socialproduction.local';
+const email = process.env.SEED_EMAIL ?? 'demo@users.socialproduction.com';
 const password = process.env.SEED_PASSWORD ?? 'DemoPass123!';
 const username = process.env.SEED_USERNAME ?? 'demo';
 

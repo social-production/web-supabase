@@ -4,12 +4,23 @@
 set -euo pipefail
 
 ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+# Preserve caller-provided hosted overrides before sourcing local defaults.
+PRESERVE_SUPABASE_URL="${SUPABASE_URL-}"
+PRESERVE_SUPABASE_ANON_KEY="${SUPABASE_ANON_KEY-}"
+PRESERVE_VITE_SUPABASE_ANON_KEY="${VITE_SUPABASE_ANON_KEY-}"
+PRESERVE_VITE_SUPABASE_FUNCTIONS_URL="${VITE_SUPABASE_FUNCTIONS_URL-}"
+
 if [[ -f "${ROOT_DIR}/.env.local" ]]; then
   set -a
   # shellcheck disable=SC1091
   source "${ROOT_DIR}/.env.local"
   set +a
 fi
+
+[[ -n "${PRESERVE_SUPABASE_URL}" ]] && SUPABASE_URL="${PRESERVE_SUPABASE_URL}"
+[[ -n "${PRESERVE_SUPABASE_ANON_KEY}" ]] && SUPABASE_ANON_KEY="${PRESERVE_SUPABASE_ANON_KEY}"
+[[ -n "${PRESERVE_VITE_SUPABASE_ANON_KEY}" ]] && VITE_SUPABASE_ANON_KEY="${PRESERVE_VITE_SUPABASE_ANON_KEY}"
+[[ -n "${PRESERVE_VITE_SUPABASE_FUNCTIONS_URL}" ]] && VITE_SUPABASE_FUNCTIONS_URL="${PRESERVE_VITE_SUPABASE_FUNCTIONS_URL}"
 
 SUPABASE_URL="${SUPABASE_URL:-http://127.0.0.1:54321}"
 FUNCTIONS_URL="${VITE_SUPABASE_FUNCTIONS_URL:-${SUPABASE_URL}/functions/v1}"
@@ -42,8 +53,8 @@ echo "== signup + auth surfaces =="
 TS=$(date +%s)
 USER_A="smokea${TS}"
 USER_B="smokeb${TS}"
-EMAIL_A="${USER_A}@users.socialproduction.local"
-EMAIL_B="${USER_B}@users.socialproduction.local"
+EMAIL_A="${USER_A}@users.socialproduction.com"
+EMAIL_B="${USER_B}@users.socialproduction.com"
 PASS='password123'
 
 curl -fsS -X POST "${SUPABASE_URL}/auth/v1/signup" \
@@ -637,7 +648,7 @@ python3 -c "import json; d=json.load(open('/tmp/sp-search.json')); assert 'resul
 # Closed community should be hidden from a brand-new non-member (user C) until invite
 TS_C=$(date +%s)
 USER_C="smokec${TS_C}"
-EMAIL_C="${USER_C}@users.socialproduction.local"
+EMAIL_C="${USER_C}@users.socialproduction.com"
 curl -fsS -X POST "${SUPABASE_URL}/auth/v1/signup" \
   -H "apikey: ${ANON_KEY}" -H "Content-Type: application/json" \
   -d "{\"email\":\"${EMAIL_C}\",\"password\":\"${PASS}\",\"data\":{\"username\":\"${USER_C}\"}}" \

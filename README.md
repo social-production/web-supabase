@@ -91,4 +91,4 @@ Full setup (remote, secrets, frontend build args): [`docs/DEPLOYMENT.md`](docs/D
 
 ## Auth mapping
 
-App usernames map to synthetic emails `username@users.socialproduction.local` for Supabase Auth. A trigger `handle_new_auth_user` creates the `public.users` row **and** a default `public.user_settings` row with the same UUID as `auth.users.id`. The special `platform` channel is seeded by migration `20260806000005_seed_platform_channel.sql`.
+App usernames map to synthetic emails `username@users.socialproduction.com` for Supabase Auth (hosted Auth rejects `.local` addresses). A trigger `handle_new_auth_user` creates the `public.users` row **and** a default `public.user_settings` row with the same UUID as `auth.users.id`. The special `platform` channel is seeded by migration `20260806000005_seed_platform_channel.sql`.
