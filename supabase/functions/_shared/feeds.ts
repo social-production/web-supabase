@@ -14,6 +14,17 @@ import { loadActiveReport, moderationFieldsFromRow } from './moderation.ts';
 
 type VoteDirection = -1 | 0 | 1;
 
+function feedAuthorFromUser(
+  user: { id?: string | null; username?: string | null; profile_image_url?: string | null } | null | undefined,
+  fallbackId?: string | null
+) {
+  return {
+    id: String(user?.id ?? fallbackId ?? ''),
+    username: user?.username ?? 'unknown',
+    profileImageUrl: user?.profile_image_url ?? null
+  };
+}
+
 function mapModeration(
   row: Record<string, unknown>,
   report: Awaited<ReturnType<typeof loadActiveReport>> | null = null
@@ -76,6 +87,7 @@ async function mapThread(db: SupabaseClient, userId: string | null, thread: any)
   const author = Array.isArray(thread.users) ? thread.users[0] : thread.users;
   const tags = await loadEntityTags(db, 'thread', thread.id);
   const report = await loadActiveReport(db, 'thread', thread.id, userId);
+  const feedAuthor = feedAuthorFromUser(author, thread.author_id);
   return {
     kind: 'thread',
     id: thread.id,
@@ -84,7 +96,8 @@ async function mapThread(db: SupabaseClient, userId: string | null, thread: any)
     createdAt: thread.created_at,
     title: thread.title,
     body: thread.body,
-    authorUsername: author?.username ?? 'unknown',
+    author: feedAuthor,
+    authorUsername: feedAuthor.username,
     ...tags,
     voteCount: thread.vote_count ?? 0,
     activeVote: await viewerVote(db, userId, 'thread', thread.id),
@@ -103,10 +116,7 @@ async function mapPost(db: SupabaseClient, userId: string | null, post: any, fee
     id: `post-activity-${post.id}`,
     href: `/posts/${post.id}`,
     createdAt: post.created_at,
-    author: {
-      username: author?.username ?? 'unknown',
-      profileImageUrl: author?.profile_image_url ?? null
-    },
+    author: feedAuthorFromUser(author, post.author_id),
     body: post.body,
     linkedSubjects: [],
     voteTargetId: post.id,
@@ -177,6 +187,7 @@ async function mapProject(
   const tags = await loadEntityTags(db, 'project', project.id);
   const signals = await signalSummary(db, 'project_signals', 'project_id', project.id, userId);
   const report = await loadActiveReport(db, 'project', project.id, userId);
+  const feedAuthor = feedAuthorFromUser(author, project.author_id);
   return {
     kind: 'project',
     id: project.id,
@@ -184,7 +195,8 @@ async function mapProject(
     href: `/projects/${project.slug}`,
     createdAt: project.created_at,
     title: project.title,
-    authorUsername: author?.username ?? 'unknown',
+    author: feedAuthor,
+    authorUsername: feedAuthor.username,
     projectMode: project.project_mode,
     projectSubtype: project.project_subtype,
     summary: project.description ?? '',
@@ -236,6 +248,7 @@ async function mapEvent(
     isPrivate: !!event.is_private,
     stage: '',
     ...tags,
+    author: feedAuthorFromUser(author, event.created_by),
     createdByUsername: author?.username ?? 'unknown',
     timeLabel: event.scheduled_at ?? event.time_label ?? '',
     locationLabel: event.location_label ?? '',
@@ -276,6 +289,7 @@ async function mapHelp(db: SupabaseClient, userId: string | null, request: any) 
     createdAt: request.created_at,
     title: request.title,
     body: request.body ?? '',
+    author: feedAuthorFromUser(author, request.author_id),
     authorUsername: author?.username ?? 'unknown',
     locationLabel: request.location_label ?? '',
     locationId: request.location_id ?? null,
@@ -457,9 +471,10 @@ async function collectCandidates(
     lat?: number | null;
     lon?: number | null;
     radiusKm?: number | null;
+    fetchLimit?: number;
   } = {}
 ) {
-  const fetchLimit = 80;
+  const fetchLimit = Math.min(Math.max(opts.fetchLimit ?? 80, 20), 80);
   const items: Array<{ sortAt: string; item: unknown }> = [];
 
   const scopedEntityIds = async (entityType: string): Promise<Set<string> | null> => {
@@ -484,10 +499,12 @@ async function collectCandidates(
     return new Set((data ?? []).map((row) => String((row as Record<string, unknown>)[meta.idCol])));
   };
 
-  const threadScopeIds = await scopedEntityIds('thread');
-  const projectScopeIds = await scopedEntityIds('project');
-  const eventScopeIds = await scopedEntityIds('event');
-  const helpScopeIds = await scopedEntityIds('help_request');
+  const [threadScopeIds, projectScopeIds, eventScopeIds, helpScopeIds] = await Promise.all([
+    scopedEntityIds('thread'),
+    scopedEntityIds('project'),
+    scopedEntityIds('event'),
+    scopedEntityIds('help_request')
+  ]);
 
   const inScope = (entityType: string, entityId: string) => {
     const set =
@@ -504,12 +521,20 @@ async function collectCandidates(
     return set.has(String(entityId));
   };
 
+  const pushMapped = (
+    mapped: Array<{ sortAt: string; item: unknown } | null | undefined>
+  ) => {
+    for (const entry of mapped) {
+      if (entry) items.push(entry);
+    }
+  };
+
   if (filter === 'all' || filter === 'threads') {
     if (!(threadScopeIds && threadScopeIds.size === 0)) {
       let q = db
         .from('threads')
         .select(
-          'id, slug, title, body, author_id, vote_count, comment_count, created_at, last_activity_at, moderation_state, users!fk_threads_author_id_users(username)'
+          'id, slug, title, body, author_id, vote_count, comment_count, created_at, last_activity_at, moderation_state, users!fk_threads_author_id_users(id, username, profile_image_url)'
         )
         .order('last_activity_at', { ascending: false })
         .limit(fetchLimit);
@@ -517,11 +542,15 @@ async function collectCandidates(
       if (opts.authorIds) q = q.in('author_id', opts.authorIds);
       if (threadScopeIds) q = q.in('id', [...threadScopeIds]);
       const { data } = await q;
-      for (const thread of data ?? []) {
-        if (!inScope('thread', thread.id)) continue;
-        const mapped = await mapThread(db, userId, thread);
-        if (mapped) items.push({ sortAt: mapped.lastActivityAt, item: mapped });
-      }
+      const scoped = (data ?? []).filter((thread) => inScope('thread', thread.id));
+      pushMapped(
+        await Promise.all(
+          scoped.map(async (thread) => {
+            const mapped = await mapThread(db, userId, thread);
+            return mapped ? { sortAt: mapped.lastActivityAt, item: mapped } : null;
+          })
+        )
+      );
     }
   }
 
@@ -535,17 +564,21 @@ async function collectCandidates(
     let q = db
       .from('posts')
       .select(
-        'id, body, author_id, audience, vote_count, comment_count, created_at, moderation_state, users!fk_posts_author_id_users(username, profile_image_url)'
+        'id, body, author_id, audience, vote_count, comment_count, created_at, moderation_state, users!fk_posts_author_id_users(id, username, profile_image_url)'
       )
       .order('created_at', { ascending: false })
       .limit(fetchLimit);
     if (opts.authorId) q = q.eq('author_id', opts.authorId);
     if (opts.authorIds) q = q.in('author_id', opts.authorIds);
     const { data } = await q;
-    for (const post of data ?? []) {
-      const mapped = await mapPost(db, userId, post, opts.authorIds ? 'following' : undefined);
-      if (mapped) items.push({ sortAt: mapped.createdAt, item: mapped });
-    }
+    pushMapped(
+      await Promise.all(
+        (data ?? []).map(async (post) => {
+          const mapped = await mapPost(db, userId, post, opts.authorIds ? 'following' : undefined);
+          return mapped ? { sortAt: mapped.createdAt, item: mapped } : null;
+        })
+      )
+    );
   }
 
   if (filter === 'all' || filter === 'projects') {
@@ -553,7 +586,7 @@ async function collectCandidates(
       let q = db
         .from('projects')
         .select(
-          'id, slug, title, description, author_id, project_mode, project_subtype, stage_label, location_label, location_id, vote_count, signal_count, comment_count, member_count, is_closed, created_at, last_activity_at, moderation_state, users!fk_projects_author_id_users(username)'
+          'id, slug, title, description, author_id, project_mode, project_subtype, stage_label, location_label, location_id, vote_count, signal_count, comment_count, member_count, is_closed, created_at, last_activity_at, moderation_state, users!fk_projects_author_id_users(id, username, profile_image_url)'
         )
         .order('last_activity_at', { ascending: false })
         .limit(fetchLimit);
@@ -567,15 +600,19 @@ async function collectCandidates(
         scopedProjects.map((project) => String(project.id)),
         []
       );
-      for (const project of scopedProjects) {
-        const mapped = await mapProject(
-          db,
-          userId,
-          project,
-          latestUpdates.get(`project:${project.id}`) ?? null
-        );
-        if (mapped) items.push({ sortAt: mapped.lastActivityAt, item: mapped });
-      }
+      pushMapped(
+        await Promise.all(
+          scopedProjects.map(async (project) => {
+            const mapped = await mapProject(
+              db,
+              userId,
+              project,
+              latestUpdates.get(`project:${project.id}`) ?? null
+            );
+            return mapped ? { sortAt: mapped.lastActivityAt, item: mapped } : null;
+          })
+        )
+      );
     }
   }
 
@@ -584,7 +621,7 @@ async function collectCandidates(
       let q = db
         .from('events')
         .select(
-          'id, slug, title, description, created_by, is_private, audience, home_community_id, location_label, location_id, scheduled_at, time_label, vote_count, comment_count, member_count, created_at, last_activity_at, moderation_state, users!fk_events_created_by_users(username)'
+          'id, slug, title, description, created_by, is_private, audience, home_community_id, location_label, location_id, scheduled_at, time_label, vote_count, comment_count, member_count, created_at, last_activity_at, moderation_state, users!fk_events_created_by_users(id, username, profile_image_url)'
         )
         .order('last_activity_at', { ascending: false })
         .limit(fetchLimit);
@@ -599,15 +636,19 @@ async function collectCandidates(
         [],
         scopedEvents.map((event) => String(event.id))
       );
-      for (const event of scopedEvents) {
-        const mapped = await mapEvent(
-          db,
-          userId,
-          event,
-          latestUpdates.get(`event:${event.id}`) ?? null
-        );
-        if (mapped) items.push({ sortAt: mapped.lastActivityAt, item: mapped });
-      }
+      pushMapped(
+        await Promise.all(
+          scopedEvents.map(async (event) => {
+            const mapped = await mapEvent(
+              db,
+              userId,
+              event,
+              latestUpdates.get(`event:${event.id}`) ?? null
+            );
+            return mapped ? { sortAt: mapped.lastActivityAt, item: mapped } : null;
+          })
+        )
+      );
     }
   }
 
@@ -616,7 +657,7 @@ async function collectCandidates(
       let q = db
         .from('help_requests')
         .select(
-          'id, title, body, author_id, location_label, location_id, schedule_label, needed_at, vote_count, comment_count, created_at, moderation_state, users!fk_help_requests_author_id_users(username)'
+          'id, title, body, author_id, location_label, location_id, schedule_label, needed_at, vote_count, comment_count, created_at, moderation_state, users!fk_help_requests_author_id_users(id, username, profile_image_url)'
         )
         .order('created_at', { ascending: false })
         .limit(fetchLimit);
@@ -624,11 +665,15 @@ async function collectCandidates(
       if (opts.authorIds) q = q.in('author_id', opts.authorIds);
       if (helpScopeIds) q = q.in('id', [...helpScopeIds]);
       const { data } = await q;
-      for (const request of data ?? []) {
-        if (!inScope('help_request', request.id)) continue;
-        const mapped = await mapHelp(db, userId, request);
-        if (mapped) items.push({ sortAt: mapped.lastActivityAt, item: mapped });
-      }
+      const scoped = (data ?? []).filter((request) => inScope('help_request', request.id));
+      pushMapped(
+        await Promise.all(
+          scoped.map(async (request) => {
+            const mapped = await mapHelp(db, userId, request);
+            return mapped ? { sortAt: mapped.lastActivityAt, item: mapped } : null;
+          })
+        )
+      );
     }
   }
 
@@ -645,15 +690,19 @@ async function collectCandidates(
     if (opts.authorId) q = q.eq('author_id', opts.authorId);
     if (opts.authorIds) q = q.in('author_id', opts.authorIds);
     const { data } = await q;
-    for (const comment of data ?? []) {
-      const mapped = await mapCommentActivity(
-        db,
-        userId,
-        comment,
-        opts.authorIds ? 'following' : undefined
-      );
-      if (mapped) items.push({ sortAt: mapped.createdAt, item: mapped });
-    }
+    pushMapped(
+      await Promise.all(
+        (data ?? []).map(async (comment) => {
+          const mapped = await mapCommentActivity(
+            db,
+            userId,
+            comment,
+            opts.authorIds ? 'following' : undefined
+          );
+          return mapped ? { sortAt: mapped.createdAt, item: mapped } : null;
+        })
+      )
+    );
   }
 
   items.sort((a, b) => String(b.sortAt).localeCompare(String(a.sortAt)));
@@ -672,7 +721,9 @@ export async function handleFeedPage(
   const sort = params.get('sort') ?? 'recent';
 
   if (kind === 'public') {
-    const items = await collectCandidates(db, userId, filter, {});
+    const items = await collectCandidates(db, userId, filter, {
+      fetchLimit: Math.min(80, Math.max(40, limit + offset + 20))
+    });
     const page = pageResult(items, limit, offset);
     return { ...page, sort, total: items.length };
   }
@@ -689,13 +740,17 @@ export async function handleFeedPage(
       authorIds = (follows ?? []).map((row) => row.followed_id);
       authorIds.push(userId);
     }
-    const following = authorIds?.length
-      ? await collectCandidates(db, userId, filter, {
-          authorIds,
-          includeCommentActivity: true
-        })
-      : [];
-    const discovery = await collectCandidates(db, userId, filter, {});
+    const candidateLimit = Math.min(80, Math.max(40, limit + offset + 20));
+    const [following, discovery] = await Promise.all([
+      authorIds?.length
+        ? collectCandidates(db, userId, filter, {
+            authorIds,
+            includeCommentActivity: true,
+            fetchLimit: candidateLimit
+          })
+        : Promise.resolve([] as unknown[]),
+      collectCandidates(db, userId, filter, { fetchLimit: candidateLimit })
+    ]);
     const seen = new Set<string>();
     const merged: unknown[] = [];
     for (const item of [...following, ...discovery]) {
@@ -718,19 +773,24 @@ export async function handleFeedPage(
       .eq('status', 'accepted');
     const authorIds = (follows ?? []).map((row) => row.followed_id);
     authorIds.push(userId);
+    const candidateLimit = Math.min(80, Math.max(40, limit + offset + 20));
     if (scope === 'following') {
       const items = await collectCandidates(db, userId, filter, {
         authorIds,
-        includeCommentActivity: true
+        includeCommentActivity: true,
+        fetchLimit: candidateLimit
       });
       return { ...pageResult(items, limit, offset), sort, total: items.length };
     }
     // popular = followed authors + public discovery (FastAPI parity)
-    const following = await collectCandidates(db, userId, filter, {
-      authorIds,
-      includeCommentActivity: true
-    });
-    const discovery = await collectCandidates(db, userId, filter, {});
+    const [following, discovery] = await Promise.all([
+      collectCandidates(db, userId, filter, {
+        authorIds,
+        includeCommentActivity: true,
+        fetchLimit: candidateLimit
+      }),
+      collectCandidates(db, userId, filter, { fetchLimit: candidateLimit })
+    ]);
     const seen = new Set<string>();
     const merged: unknown[] = [];
     for (const item of [...following, ...discovery]) {
@@ -752,7 +812,8 @@ export async function handleFeedPage(
     if (!profile) return pageResult([], limit, offset);
     const items = await collectCandidates(db, userId, filter, {
       authorId: profile.id,
-      includeCommentActivity: true
+      includeCommentActivity: true,
+      fetchLimit: Math.min(80, Math.max(40, limit + offset + 20))
     });
     return { ...pageResult(items, limit, offset), sort, total: items.length };
   }

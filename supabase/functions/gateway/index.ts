@@ -385,7 +385,6 @@ Deno.serve(async (req) => {
             profileImageUrl: u?.profile_image_url ?? null
           };
         });
-        const participantById = new Map(participants.map((p) => [p.id, p]));
         const partner =
           conversation.kind === 'direct'
             ? participants.find((p) => p.id !== userId) ?? null
@@ -394,12 +393,14 @@ Deno.serve(async (req) => {
           conversation.kind === 'direct'
             ? partner?.username ?? 'Direct message'
             : (conversation.title ?? 'Group chat');
-        const { data: msgs } = await db
+        // List payload: preview only. Full history loads via /messages/conversations/:id/messages.
+        const { data: latestMsgs } = await db
           .from('messages')
-          .select('id, sender_id, encrypted_body, created_at, moderation_state')
+          .select('id, sender_id, encrypted_body, created_at')
           .eq('conversation_id', conversation.id)
-          .order('created_at', { ascending: true })
-          .limit(100);
+          .order('created_at', { ascending: false })
+          .limit(1);
+        const latest = latestMsgs?.[0] ?? null;
         let unreadQuery = db
           .from('messages')
           .select('*', { count: 'exact', head: true })
@@ -414,24 +415,10 @@ Deno.serve(async (req) => {
           kind: conversation.kind,
           title,
           participants,
-          preview: msgs?.at(-1)?.encrypted_body ?? '',
+          preview: latest?.encrypted_body ?? '',
           lastMessageAt: conversation.last_message_at ?? conversation.created_at,
           unreadCount: unreadCount ?? 0,
-          messages: (msgs ?? []).map((m) => {
-            const sender = participantById.get(m.sender_id) ?? {
-              id: m.sender_id,
-              username: 'unknown',
-              profileImageUrl: null
-            };
-            return {
-              id: m.id,
-              sender,
-              body: m.encrypted_body,
-              createdAt: m.created_at,
-              isOwn: m.sender_id === userId,
-              moderationState: m.moderation_state ?? 'visible'
-            };
-          })
+          messages: []
         });
       }
       conversations.sort((a, b) => String(b.lastMessageAt).localeCompare(String(a.lastMessageAt)));
@@ -442,6 +429,58 @@ Deno.serve(async (req) => {
         linkedChats: linked.items.map(mapLinkedChatToFrontend),
         suggestedContacts: [],
         activeConversationId: conversations[0]?.id ?? null
+      });
+    }
+    if (
+      req.method === 'GET' &&
+      path.match(/^\/messages\/conversations\/[^/]+\/messages$/)
+    ) {
+      if (!userId) return error('unauthorized', 401);
+      const conversationId = path.split('/')[3];
+      const { data: membership } = await db
+        .from('conversation_members')
+        .select('conversation_id')
+        .eq('conversation_id', conversationId)
+        .eq('user_id', userId)
+        .maybeSingle();
+      if (!membership) return error('not_found', 404);
+      const { data: members } = await db
+        .from('conversation_members')
+        .select('user_id, users!fk_conversation_members_user_id_users(id, username, profile_image_url)')
+        .eq('conversation_id', conversationId);
+      const participants = (members ?? []).map((m) => {
+        const u = Array.isArray(m.users) ? m.users[0] : m.users;
+        return {
+          id: u?.id ?? m.user_id,
+          username: u?.username ?? 'unknown',
+          profileImageUrl: u?.profile_image_url ?? null
+        };
+      });
+      const participantById = new Map(participants.map((p) => [p.id, p]));
+      const limit = Math.min(Math.max(Number(url.searchParams.get('limit') ?? 100), 1), 200);
+      const { data: msgs } = await db
+        .from('messages')
+        .select('id, sender_id, encrypted_body, created_at, moderation_state')
+        .eq('conversation_id', conversationId)
+        .order('created_at', { ascending: true })
+        .limit(limit);
+      return json({
+        conversationId,
+        messages: (msgs ?? []).map((m) => {
+          const sender = participantById.get(m.sender_id) ?? {
+            id: m.sender_id,
+            username: 'unknown',
+            profileImageUrl: null
+          };
+          return {
+            id: m.id,
+            sender,
+            body: m.encrypted_body,
+            createdAt: m.created_at,
+            isOwn: m.sender_id === userId,
+            moderationState: m.moderation_state ?? 'visible'
+          };
+        })
       });
     }
     if (req.method === 'GET' && path === '/messages/linked-chats') {

@@ -16,56 +16,6 @@ type LinkedChatItem = {
   unread_count: number;
 };
 
-async function lastReadAt(
-  db: SupabaseClient,
-  userId: string,
-  subjectType: string,
-  subjectId: string
-) {
-  const { data } = await db
-    .from('subject_chat_reads')
-    .select('last_read_at')
-    .eq('user_id', userId)
-    .eq('subject_type', subjectType)
-    .eq('subject_id', subjectId)
-    .maybeSingle();
-  return (data?.last_read_at as string | null | undefined) ?? null;
-}
-
-async function unreadCount(
-  db: SupabaseClient,
-  subjectType: string,
-  subjectId: string,
-  userId: string,
-  lastRead: string | null
-) {
-  let query = db
-    .from('comments')
-    .select('*', { count: 'exact', head: true })
-    .eq('subject_type', subjectType)
-    .eq('subject_id', subjectId)
-    .neq('author_id', userId);
-  if (lastRead) query = query.gt('created_at', lastRead);
-  const { count } = await query;
-  return count ?? 0;
-}
-
-async function lastComment(
-  db: SupabaseClient,
-  subjectType: string,
-  subjectId: string
-) {
-  const { data } = await db
-    .from('comments')
-    .select('body, created_at')
-    .eq('subject_type', subjectType)
-    .eq('subject_id', subjectId)
-    .order('created_at', { ascending: false })
-    .limit(1)
-    .maybeSingle();
-  return data;
-}
-
 async function buildKindItems(
   db: SupabaseClient,
   userId: string,
@@ -78,24 +28,61 @@ async function buildKindItems(
     comment_count?: number | null;
   }>
 ): Promise<LinkedChatItem[]> {
-  const items: LinkedChatItem[] = [];
-  for (const row of rows) {
-    const comment = await lastComment(db, kind, String(row.id));
-    const lastRead = await lastReadAt(db, userId, kind, String(row.id));
-    const unread = await unreadCount(db, kind, String(row.id), userId, lastRead);
-    items.push({
-      id: String(row.id),
+  if (!rows.length) return [];
+
+  const ids = rows.map((row) => String(row.id));
+  const [{ data: comments }, { data: reads }] = await Promise.all([
+    db
+      .from('comments')
+      .select('subject_id, body, created_at, author_id')
+      .eq('subject_type', kind)
+      .in('subject_id', ids)
+      .order('created_at', { ascending: false }),
+    db
+      .from('subject_chat_reads')
+      .select('subject_id, last_read_at')
+      .eq('user_id', userId)
+      .eq('subject_type', kind)
+      .in('subject_id', ids)
+  ]);
+
+  const latestBySubject = new Map<string, { body: string; created_at: string }>();
+  const unreadBySubject = new Map<string, number>();
+  for (const id of ids) unreadBySubject.set(id, 0);
+
+  const readMap = new Map(
+    (reads ?? []).map((row) => [String(row.subject_id), String(row.last_read_at)])
+  );
+
+  for (const row of comments ?? []) {
+    const subjectId = String(row.subject_id);
+    if (!latestBySubject.has(subjectId)) {
+      latestBySubject.set(subjectId, {
+        body: String(row.body ?? ''),
+        created_at: String(row.created_at)
+      });
+    }
+    if (String(row.author_id) === userId) continue;
+    const lastRead = readMap.get(subjectId);
+    if (lastRead && String(row.created_at) <= lastRead) continue;
+    unreadBySubject.set(subjectId, (unreadBySubject.get(subjectId) ?? 0) + 1);
+  }
+
+  return rows.map((row) => {
+    const id = String(row.id);
+    const comment = latestBySubject.get(id);
+    return {
+      id,
       kind,
-      entity_id: String(row.id),
+      entity_id: id,
       entity_slug: String(row.slug ?? row.id),
       title: String(row.title),
-      preview: comment?.body ? String(comment.body).slice(0, 200) : '',
+      preview: comment?.body ? comment.body.slice(0, 200) : '',
       last_message_at: String(comment?.created_at ?? row.last_activity_at ?? new Date().toISOString()),
       comment_count: Number(row.comment_count ?? 0),
-      unread_count: unread
-    });
-  }
-  return items;
+      unread_count: unreadBySubject.get(id) ?? 0
+    };
+  });
 }
 
 export async function buildLinkedChats(db: SupabaseClient, userId: string) {
@@ -268,18 +255,39 @@ export async function countLinkedChatUnread(db: SupabaseClient, userId: string) 
     (reads ?? []).map((row) => [`${row.subject_type}:${row.subject_id}`, String(row.last_read_at)])
   );
 
+  const byType = {
+    project: subjects.filter((s) => s.type === 'project').map((s) => s.id),
+    event: subjects.filter((s) => s.type === 'event').map((s) => s.id),
+    help_request: subjects.filter((s) => s.type === 'help_request').map((s) => s.id)
+  };
+
+  const commentQueries = (
+    [
+      ['project', byType.project],
+      ['event', byType.event],
+      ['help_request', byType.help_request]
+    ] as const
+  )
+    .filter(([, ids]) => ids.length > 0)
+    .map(([type, ids]) =>
+      db
+        .from('comments')
+        .select('subject_type, subject_id, created_at')
+        .eq('subject_type', type)
+        .in('subject_id', ids)
+        .neq('author_id', userId)
+        .then(({ data }) => data ?? [])
+    );
+
+  const commentBatches = await Promise.all(commentQueries);
   let total = 0;
-  for (const subject of subjects) {
-    let query = db
-      .from('comments')
-      .select('*', { count: 'exact', head: true })
-      .eq('subject_type', subject.type)
-      .eq('subject_id', subject.id)
-      .neq('author_id', userId);
-    const lastRead = readMap.get(`${subject.type}:${subject.id}`);
-    if (lastRead) query = query.gt('created_at', lastRead);
-    const { count } = await query;
-    total += count ?? 0;
+  for (const rows of commentBatches) {
+    for (const row of rows) {
+      const key = `${row.subject_type}:${row.subject_id}`;
+      const lastRead = readMap.get(key);
+      if (lastRead && String(row.created_at) <= lastRead) continue;
+      total += 1;
+    }
   }
   return total;
 }
