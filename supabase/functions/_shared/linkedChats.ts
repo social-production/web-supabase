@@ -212,3 +212,74 @@ export function mapLinkedChatToFrontend(item: LinkedChatItem) {
     comments: [] as unknown[]
   };
 }
+
+/** Lightweight unread total for badge polls — no title/preview hydration. */
+export async function countLinkedChatUnread(db: SupabaseClient, userId: string) {
+  const [{ data: projectMemberships }, { data: eventMemberships }, { data: ownedHelp }] =
+    await Promise.all([
+      db.from('project_memberships').select('project_id').eq('user_id', userId),
+      db.from('event_memberships').select('event_id').eq('user_id', userId),
+      db.from('help_requests').select('id').eq('author_id', userId)
+    ]);
+
+  const projectIds = new Set((projectMemberships ?? []).map((row) => String(row.project_id)));
+  const eventIds = new Set((eventMemberships ?? []).map((row) => String(row.event_id)));
+  const helpIds = new Set((ownedHelp ?? []).map((row) => String(row.id)));
+
+  const [{ data: projectComments }, { data: eventComments }, { data: helpComments }] =
+    await Promise.all([
+      db.from('comments').select('subject_id').eq('subject_type', 'project').eq('author_id', userId),
+      db.from('comments').select('subject_id').eq('subject_type', 'event').eq('author_id', userId),
+      db
+        .from('comments')
+        .select('subject_id')
+        .eq('subject_type', 'help_request')
+        .eq('author_id', userId)
+    ]);
+  for (const row of projectComments ?? []) projectIds.add(String(row.subject_id));
+  for (const row of eventComments ?? []) eventIds.add(String(row.subject_id));
+  for (const row of helpComments ?? []) helpIds.add(String(row.subject_id));
+
+  const { data: assignedRoles } = await db
+    .from('help_request_role_assignments')
+    .select('role_id')
+    .eq('user_id', userId);
+  const roleIds = (assignedRoles ?? []).map((row) => String(row.role_id));
+  if (roleIds.length) {
+    const { data: roles } = await db
+      .from('help_request_roles')
+      .select('help_request_id')
+      .in('id', roleIds);
+    for (const row of roles ?? []) helpIds.add(String(row.help_request_id));
+  }
+
+  const subjects: Array<{ type: 'project' | 'event' | 'help_request'; id: string }> = [
+    ...[...projectIds].map((id) => ({ type: 'project' as const, id })),
+    ...[...eventIds].map((id) => ({ type: 'event' as const, id })),
+    ...[...helpIds].map((id) => ({ type: 'help_request' as const, id }))
+  ];
+  if (!subjects.length) return 0;
+
+  const { data: reads } = await db
+    .from('subject_chat_reads')
+    .select('subject_type, subject_id, last_read_at')
+    .eq('user_id', userId);
+  const readMap = new Map(
+    (reads ?? []).map((row) => [`${row.subject_type}:${row.subject_id}`, String(row.last_read_at)])
+  );
+
+  let total = 0;
+  for (const subject of subjects) {
+    let query = db
+      .from('comments')
+      .select('*', { count: 'exact', head: true })
+      .eq('subject_type', subject.type)
+      .eq('subject_id', subject.id)
+      .neq('author_id', userId);
+    const lastRead = readMap.get(`${subject.type}:${subject.id}`);
+    if (lastRead) query = query.gt('created_at', lastRead);
+    const { count } = await query;
+    total += count ?? 0;
+  }
+  return total;
+}

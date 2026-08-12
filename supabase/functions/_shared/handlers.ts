@@ -15,7 +15,7 @@ import { castReportVote, loadActiveReport, loadActiveReportsByTargetIds, reconci
 import { handleFeedPage as assembleFeedPage, handleMapMarkers, viewerVote as feedViewerVote } from './feeds.ts';
 import { recordMeaningfulAction } from './votes.ts';
 import { buildActivityRail } from './activityRail.ts';
-import { buildLinkedChats } from './linkedChats.ts';
+import { buildLinkedChats, countLinkedChatUnread } from './linkedChats.ts';
 
 type VoteDirection = -1 | 0 | 1;
 
@@ -47,23 +47,16 @@ async function loadViewer(db: SupabaseClient, userId: string | null) {
   };
 }
 
-async function unreadCounts(
-  db: SupabaseClient,
-  userId: string | null,
-  options: { includeLinked?: boolean } = {}
-) {
+async function unreadCounts(db: SupabaseClient, userId: string | null) {
   if (!userId) return { notifications: 0, messages: 0 };
-  const includeLinked = options.includeLinked === true;
-  const [{ count: notifications }, { data: memberships }, linked] = await Promise.all([
+  const [{ count: notifications }, { data: memberships }, linkedUnread] = await Promise.all([
     db
       .from('notifications')
       .select('*', { count: 'exact', head: true })
       .eq('recipient_id', userId)
       .eq('is_unread', true),
     db.from('conversation_members').select('conversation_id, last_read_at').eq('user_id', userId),
-    includeLinked
-      ? buildLinkedChats(db, userId)
-      : Promise.resolve({ items: [] as Array<{ unread_count?: number }> })
+    countLinkedChatUnread(db, userId)
   ]);
 
   let messages = 0;
@@ -80,7 +73,7 @@ async function unreadCounts(
     messages += count ?? 0;
   }
 
-  messages += linked.items.reduce((sum, item) => sum + Number(item.unread_count ?? 0), 0);
+  messages += linkedUnread;
 
   return { notifications: notifications ?? 0, messages };
 }
