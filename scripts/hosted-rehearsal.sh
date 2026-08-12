@@ -38,7 +38,9 @@ echo "== db push =="
 npx --yes supabase@latest db push --linked
 
 echo "== deploy gateway =="
-npx --yes supabase@latest functions deploy gateway --project-ref "$PROJECT_REF"
+# Bundle server-side so CI does not pull public.ecr.aws/supabase/edge-runtime
+# (GitHub Actions runners often hit Docker/ECR "toomanyrequests: Rate exceeded").
+npx --yes supabase@latest functions deploy gateway --project-ref "$PROJECT_REF" --use-api
 
 # Hosted smoke creates disposable users/content. Keep production/beta clean by default.
 # Opt in with HOSTED_SMOKE=1 when you explicitly want a cloud dress rehearsal.
