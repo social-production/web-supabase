@@ -6,6 +6,11 @@ import type { SupabaseClient } from 'https://esm.sh/@supabase/supabase-js@2.49.1
 import { closeAndMaybeConvert } from './conversion.ts';
 import { displayStageLabel } from './phases.ts';
 import {
+  ensureEventAdvanceAllowed,
+  ensureProjectAdvanceAllowed,
+  resolveProjectSubtype
+} from './lifecycleGates.ts';
+import {
   canStillPass,
   eventPopulation,
   isPassing,
@@ -25,6 +30,25 @@ async function getEvent(db: SupabaseClient, slug: string) {
   const { data } = await db.from('events').select('*').eq('slug', slug).maybeSingle();
   if (!data) throw new Error('not_found');
   return data;
+}
+
+async function projectMembership(db: SupabaseClient, projectId: string, userId: string) {
+  const { data } = await db
+    .from('project_memberships')
+    .select('user_id, is_manager')
+    .eq('project_id', projectId)
+    .eq('user_id', userId)
+    .maybeSingle();
+  return data;
+}
+
+async function governedProjectForMember(db: SupabaseClient, slug: string, userId: string) {
+  const project = await getProject(db, slug);
+  if (String(project.project_mode) === 'personal-service') {
+    throw new Error('personal_service_governance_disabled');
+  }
+  if (!(await projectMembership(db, project.id, userId))) throw new Error('forbidden');
+  return project;
 }
 
 function voteLabel(vote: unknown): 'yes' | 'no' {
@@ -79,7 +103,7 @@ export async function castProjectPlanVote(
   planId: string,
   vote: unknown
 ) {
-  const project = await getProject(db, slug);
+  const project = await governedProjectForMember(db, slug, userId);
   await castOverallPlanVote(db, 'project_plan_votes', planId, userId, vote);
   const { data: votes } = await db.from('project_plan_votes').select('vote').eq('plan_id', planId);
   const stats = summarizeVotes(votes ?? []);
@@ -144,7 +168,7 @@ export async function castProjectPlanValueVote(
   valueId: string,
   vote: unknown
 ) {
-  await getProject(db, slug);
+  await governedProjectForMember(db, slug, userId);
   if (isClearVote(vote)) {
     const { error } = await db
       .from('project_plan_value_votes')
@@ -200,7 +224,7 @@ export async function castProjectPlanCriterionRating(
   criterionId: string,
   rating: unknown
 ) {
-  await getProject(db, slug);
+  await governedProjectForMember(db, slug, userId);
   if (rating == null || rating === '' || rating === 0 || rating === '0') {
     const { error } = await db
       .from('project_plan_criterion_ratings')
@@ -257,7 +281,7 @@ export async function voteProjectValueImportance(
   valueId: string,
   importance: unknown
 ) {
-  await getProject(db, slug);
+  await governedProjectForMember(db, slug, userId);
   const value = Math.max(1, Math.min(10, Number(importance) || 0));
   if (value < 1) throw new Error('invalid_importance');
   const { error } = await db.from('project_value_importance_votes').upsert(
@@ -330,16 +354,21 @@ export async function voteProjectPhaseChange(
   if (!request) throw new Error('not_found');
   if (isPassing(stats, population)) {
     const targetPhaseId = String(request.target_phase_id);
+    if (request.change_kind !== 'return') {
+      await ensureProjectAdvanceAllowed(db, project, targetPhaseId);
+    }
     if (targetPhaseId === 'phase-7' || targetPhaseId === 'closed') {
       await closeAndMaybeConvert(db, project, request, userId);
     } else {
-      const subtype =
-        project.project_subtype != null ? String(project.project_subtype) : null;
+      const subtype = await resolveProjectSubtype(db, project);
       await db
         .from('projects')
         .update({
           current_phase_id: targetPhaseId,
           stage_label: displayStageLabel(String(project.project_mode), subtype, targetPhaseId),
+          ...(subtype && subtype !== project.project_subtype
+            ? { project_subtype: subtype }
+            : {}),
           is_closed: false,
           last_activity_at: new Date().toISOString()
         })
@@ -401,6 +430,9 @@ export async function voteEventPhaseChange(
     .maybeSingle();
   if (!request) throw new Error('not_found');
   if (isPassing(stats, population)) {
+    if (request.change_kind !== 'return') {
+      await ensureEventAdvanceAllowed(db, event, String(request.target_phase_id));
+    }
     await db
       .from('events')
       .update({
@@ -752,7 +784,8 @@ export async function createSettingsChangeRequest(
   const reason = String(body.reason ?? '').trim();
 
   if (String(project.project_mode) === 'personal-service') {
-    if (project.author_id !== userId) throw new Error('forbidden');
+    const membership = await projectMembership(db, project.id, userId);
+    if (project.author_id !== userId && !membership?.is_manager) throw new Error('forbidden');
     const { error } = await db.from('project_service_request_settings').upsert(
       {
         project_id: project.id,
@@ -774,6 +807,7 @@ export async function createSettingsChangeRequest(
     };
   }
 
+  if (!(await projectMembership(db, project.id, userId))) throw new Error('forbidden');
   if (!reason) throw new Error('invalid_reason');
   const { data, error } = await db
     .from('project_service_request_setting_changes')
@@ -800,6 +834,7 @@ export async function voteSettingsChangeRequest(
   vote: unknown
 ) {
   const project = await getProject(db, slug);
+  if (!(await projectMembership(db, project.id, userId))) throw new Error('forbidden');
   await upsertScopedVote(db, 'project_service_request_setting_change_votes', 'request_id,voter_id', {
     request_id: requestId,
     voter_id: userId,
@@ -815,6 +850,7 @@ export async function voteSettingsChangeRequest(
     .from('project_service_request_setting_changes')
     .select('*')
     .eq('id', requestId)
+    .eq('project_id', project.id)
     .maybeSingle();
   if (!request) throw new Error('not_found');
   if (isPassing(stats, population)) {
@@ -1252,7 +1288,8 @@ export async function upsertActivityRating(
   userId: string,
   kind: 'project' | 'event',
   activityId: string,
-  rating: number
+  rating: number,
+  comment?: string | null
 ) {
   const table = kind === 'project' ? 'project_activity_ratings' : 'event_activity_ratings';
   const value = Math.max(1, Math.min(5, Number(rating) || 1));
@@ -1260,7 +1297,8 @@ export async function upsertActivityRating(
     {
       activity_id: activityId,
       user_id: userId,
-      rating: value
+      rating: value,
+      comment: String(comment ?? '').trim() || null
     },
     { onConflict: 'activity_id,user_id' }
   );

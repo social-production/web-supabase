@@ -237,7 +237,7 @@ echo "== projects / events / help + lifecycle aliases =="
 curl -fsS -X POST "${user_a[@]}" "${FUNCTIONS_URL}/gateway/projects" \
   -d "{\"title\":\"Smoke project\",\"description\":\"parity\",\"channelTags\":[{\"slug\":\"platform\",\"label\":\"Platform\",\"kind\":\"channel\"},{\"slug\":\"${CHANNEL_SLUG}\",\"label\":\"Smoke Channel\",\"kind\":\"channel\"}]}" >/tmp/sp-project.json
 PROJECT_SLUG=$(python3 -c "import json; print(json.load(open('/tmp/sp-project.json'))['slug'])")
-curl -fsS -X POST "${user_a[@]}" "${FUNCTIONS_URL}/gateway/projects/${PROJECT_SLUG}/membership" >/tmp/sp-join.json
+curl -fsS -X POST "${user_b[@]}" "${FUNCTIONS_URL}/gateway/projects/${PROJECT_SLUG}/membership" >/tmp/sp-join.json
 curl -fsS -X POST "${user_a[@]}" "${FUNCTIONS_URL}/gateway/projects/${PROJECT_SLUG}/signal" \
   -d '{"signal":"demand"}' >/tmp/sp-signal.json
 python3 -c "import json; d=json.load(open('/tmp/sp-signal.json')); assert d.get('ok') is True; assert d.get('action') in ('added','switched','none'); assert d.get('signalType')=='demand'; s=d.get('signals') or {}; assert 'demand' in s and 'opposition' in s and 'total' in s; assert int(s['demand'])>=1"
@@ -248,6 +248,8 @@ python3 -c "import json; d=json.load(open('/tmp/sp-signal-off.json')); assert d.
 curl -fsS -X POST "${user_a[@]}" "${FUNCTIONS_URL}/gateway/projects/${PROJECT_SLUG}/signal" \
   -d '{"signal":"demand"}' >/tmp/sp-signal-on.json
 python3 -c "import json; d=json.load(open('/tmp/sp-signal-on.json')); assert d.get('action')=='added'"
+curl -fsS -X POST "${user_b[@]}" "${FUNCTIONS_URL}/gateway/projects/${PROJECT_SLUG}/signal" \
+  -d '{"signal":"demand"}' >/tmp/sp-signal-b.json
 curl -fsS -X POST "${user_a[@]}" "${FUNCTIONS_URL}/gateway/projects/${PROJECT_SLUG}/values" \
   -d '{"label":"Smoke value"}' >/tmp/sp-value.json
 curl -fsS -X POST "${user_a[@]}" "${FUNCTIONS_URL}/gateway/projects/${PROJECT_SLUG}/production-plans" \
@@ -375,6 +377,8 @@ PHASE_PROJECT_SLUG=$(python3 -c "import json; print(json.load(open('/tmp/sp-phas
 # Creator is already a member; only join B so quorum needs 2 votes
 curl -fsS -X POST "${user_b[@]}" "${FUNCTIONS_URL}/gateway/projects/${PHASE_PROJECT_SLUG}/membership" >/tmp/sp-phase-join-b.json
 python3 -c "import json; assert json.load(open('/tmp/sp-phase-join-b.json')).get('viewerIsMember') is True"
+curl -fsS -X POST "${user_a[@]}" "${FUNCTIONS_URL}/gateway/projects/${PHASE_PROJECT_SLUG}/signal" \
+  -d '{"signal":"demand"}' >/tmp/sp-phase-signal.json
 curl -fsS -X POST "${user_a[@]}" "${FUNCTIONS_URL}/gateway/projects/${PHASE_PROJECT_SLUG}/phase-change" \
   -d '{"targetPhaseId":"phase-2","changeKind":"advance","reason":"advance to planning"}' >/tmp/sp-advance-req.json
 ADVANCE_REQ_ID=$(python3 -c "import json; d=json.load(open('/tmp/sp-advance-req.json')); assert d.get('ok') is True; print(d['id'])")
@@ -437,6 +441,8 @@ PHASE_EVENT_SLUG=$(python3 -c "import json; print(json.load(open('/tmp/sp-phase-
 # Creator already a member; join B for 2-member quorum
 curl -fsS -X POST "${user_b[@]}" "${FUNCTIONS_URL}/gateway/events/${PHASE_EVENT_SLUG}/membership" >/tmp/sp-phase-event-join-b.json
 python3 -c "import json; assert json.load(open('/tmp/sp-phase-event-join-b.json')).get('viewerIsMember') is True"
+curl -fsS -X POST "${user_a[@]}" "${FUNCTIONS_URL}/gateway/events/${PHASE_EVENT_SLUG}/signal" \
+  -d '{"signal":"demand"}' >/tmp/sp-event-signal.json
 curl -fsS -X POST "${user_a[@]}" "${FUNCTIONS_URL}/gateway/events/${PHASE_EVENT_SLUG}/phase-change" \
   -d '{"targetPhaseId":"event-plan","reason":"advance event"}' >/tmp/sp-event-advance-req.json
 EVENT_ADVANCE_ID=$(python3 -c "import json; d=json.load(open('/tmp/sp-event-advance-req.json')); assert d.get('ok') is True; print(d['id'])")
@@ -713,10 +719,33 @@ if code == 200:
 
 # Close+convert execution via phase-change vote (2-member quorum)
 curl -fsS -X POST "${user_a[@]}" "${FUNCTIONS_URL}/gateway/projects" \
-  -d "{\"title\":\"Smoke convert pred\",\"description\":\"will convert\",\"channelTags\":[{\"slug\":\"${CHANNEL_SLUG}\",\"label\":\"Smoke Channel\",\"kind\":\"channel\"}]}" \
+  -d "{\"title\":\"Smoke convert pred\",\"description\":\"will convert\",\"projectSubtype\":\"software\",\"channelTags\":[{\"slug\":\"${CHANNEL_SLUG}\",\"label\":\"Smoke Channel\",\"kind\":\"channel\"}]}" \
   >/tmp/sp-convert-proj.json
 CONVERT_SLUG=$(python3 -c "import json; print(json.load(open('/tmp/sp-convert-proj.json'))['slug'])")
 curl -fsS -X POST "${user_b[@]}" "${FUNCTIONS_URL}/gateway/projects/${CONVERT_SLUG}/membership" >/tmp/sp-convert-join.json
+curl -fsS -X POST "${user_a[@]}" "${FUNCTIONS_URL}/gateway/projects/${CONVERT_SLUG}/signal" \
+  -d '{"signal":"demand"}' >/tmp/sp-convert-signal.json
+curl -fsS -X POST "${user_a[@]}" "${FUNCTIONS_URL}/gateway/projects/${CONVERT_SLUG}/phase-change" \
+  -d '{"targetPhaseId":"phase-2","changeKind":"advance","reason":"start planning"}' >/tmp/sp-convert-plan-phase.json
+CONVERT_PLAN_PHASE_REQ=$(python3 -c "import json; print(json.load(open('/tmp/sp-convert-plan-phase.json'))['id'])")
+curl -fsS -X POST "${user_a[@]}" "${FUNCTIONS_URL}/gateway/projects/${CONVERT_SLUG}/phase-change/vote" \
+  -d "{\"requestId\":\"${CONVERT_PLAN_PHASE_REQ}\",\"vote\":\"yes\"}" >/dev/null
+curl -fsS -X POST "${user_b[@]}" "${FUNCTIONS_URL}/gateway/projects/${CONVERT_SLUG}/phase-change/vote" \
+  -d "{\"requestId\":\"${CONVERT_PLAN_PHASE_REQ}\",\"vote\":\"yes\"}" >/dev/null
+curl -fsS -X POST "${user_a[@]}" "${FUNCTIONS_URL}/gateway/projects/${CONVERT_SLUG}/production-plans" \
+  -d '{"title":"Conversion production plan","description":"approved path","projectSubtype":"software"}' >/tmp/sp-convert-plan.json
+CONVERT_PLAN_ID=$(python3 -c "import json; print(json.load(open('/tmp/sp-convert-plan.json'))['id'])")
+curl -fsS -X POST "${user_a[@]}" "${FUNCTIONS_URL}/gateway/projects/${CONVERT_SLUG}/plans/overall-vote" \
+  -d "{\"planId\":\"${CONVERT_PLAN_ID}\",\"vote\":\"yes\"}" >/dev/null
+curl -fsS -X POST "${user_b[@]}" "${FUNCTIONS_URL}/gateway/projects/${CONVERT_SLUG}/plans/overall-vote" \
+  -d "{\"planId\":\"${CONVERT_PLAN_ID}\",\"vote\":\"yes\"}" >/dev/null
+curl -fsS -X POST "${user_a[@]}" "${FUNCTIONS_URL}/gateway/projects/${CONVERT_SLUG}/phase-change" \
+  -d '{"targetPhaseId":"phase-5","changeKind":"advance","reason":"begin activity"}' >/tmp/sp-convert-activity-phase.json
+CONVERT_ACTIVITY_REQ=$(python3 -c "import json; print(json.load(open('/tmp/sp-convert-activity-phase.json'))['id'])")
+curl -fsS -X POST "${user_a[@]}" "${FUNCTIONS_URL}/gateway/projects/${CONVERT_SLUG}/phase-change/vote" \
+  -d "{\"requestId\":\"${CONVERT_ACTIVITY_REQ}\",\"vote\":\"yes\"}" >/dev/null
+curl -fsS -X POST "${user_b[@]}" "${FUNCTIONS_URL}/gateway/projects/${CONVERT_SLUG}/phase-change/vote" \
+  -d "{\"requestId\":\"${CONVERT_ACTIVITY_REQ}\",\"vote\":\"yes\"}" >/dev/null
 curl -fsS -X POST "${user_a[@]}" "${FUNCTIONS_URL}/gateway/projects/${CONVERT_SLUG}/phase-change" \
   -d '{"targetPhaseId":"phase-7","changeKind":"advance","reason":"convert to collective","closeOutcome":"convert","conversionTarget":{"projectMode":"collective-service","projectSubtype":"standard","successorTitle":"Smoke convert succ","successorDescription":"successor"}}' \
   >/tmp/sp-convert-req.json

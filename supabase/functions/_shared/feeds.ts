@@ -1107,6 +1107,31 @@ async function collectCandidates(
   );
 }
 
+function orderFeedItems(items: unknown[], sort: string): unknown[] {
+  if (sort === 'recent') return items;
+  const rows = [...items] as Array<Record<string, unknown>>;
+  const timestamp = (item: Record<string, unknown>) =>
+    Date.parse(String(item.lastActivityAt ?? item.createdAt ?? '')) || 0;
+  if (sort === 'oldest') {
+    return rows.sort((a, b) => timestamp(a) - timestamp(b));
+  }
+  const engagement = (item: Record<string, unknown>) =>
+    Number(item.voteCount ?? 0) +
+    Number(item.commentCount ?? item.replyCount ?? 0) * 2 +
+    Number(item.memberCount ?? 0);
+  if (sort === 'popular' || sort === 'top') {
+    return rows.sort((a, b) => engagement(b) - engagement(a) || timestamp(b) - timestamp(a));
+  }
+  if (sort === 'trending') {
+    const score = (item: Record<string, unknown>) => {
+      const ageHours = Math.max(1, (Date.now() - timestamp(item)) / 3_600_000);
+      return (engagement(item) + 1) / Math.pow(ageHours + 2, 1.2);
+    };
+    return rows.sort((a, b) => score(b) - score(a) || timestamp(b) - timestamp(a));
+  }
+  return rows;
+}
+
 export async function handleFeedPage(
   db: SupabaseClient,
   userId: string | null,
@@ -1118,14 +1143,15 @@ export async function handleFeedPage(
   const filter = params.get('filter') ?? 'all';
   const sort = params.get('sort') ?? 'recent';
   const before = params.get('before');
-  const pageOffset = before ? 0 : offset;
+  const candidateBefore = sort === 'recent' ? before : null;
+  const pageOffset = candidateBefore ? 0 : offset;
 
   if (kind === 'public') {
     const items = await collectCandidates(db, userId, filter, {
-      before,
+      before: candidateBefore,
       fetchLimit: Math.min(80, Math.max(40, limit + offset + 20))
     });
-    const page = pageResult(items, limit, pageOffset);
+    const page = pageResult(orderFeedItems(items, sort), limit, pageOffset);
     return { ...page, sort, total: items.length };
   }
 
@@ -1146,10 +1172,10 @@ export async function handleFeedPage(
       authorIds,
       includeDiscovery: true,
       includeCommentActivity: true,
-      before,
+      before: candidateBefore,
       fetchLimit: candidateLimit
     });
-    const page = pageResult(items, limit, pageOffset);
+    const page = pageResult(orderFeedItems(items, sort), limit, pageOffset);
     return { ...page, sort, total: items.length };
   }
 
@@ -1168,20 +1194,28 @@ export async function handleFeedPage(
       const items = await collectCandidates(db, userId, filter, {
         authorIds,
         includeCommentActivity: true,
-        before,
+        before: candidateBefore,
         fetchLimit: candidateLimit
       });
-      return { ...pageResult(items, limit, pageOffset), sort, total: items.length };
+      return {
+        ...pageResult(orderFeedItems(items, sort), limit, pageOffset),
+        sort,
+        total: items.length
+      };
     }
     // Popular combines followed authors and discovery in the candidate RPC.
     const items = await collectCandidates(db, userId, filter, {
       authorIds,
       includeDiscovery: true,
       includeCommentActivity: true,
-      before,
+      before: candidateBefore,
       fetchLimit: candidateLimit
     });
-    return { ...pageResult(items, limit, pageOffset), sort, total: items.length };
+    return {
+      ...pageResult(orderFeedItems(items, sort), limit, pageOffset),
+      sort,
+      total: items.length
+    };
   }
 
   if (kind === 'user') {
@@ -1195,10 +1229,14 @@ export async function handleFeedPage(
     const items = await collectCandidates(db, userId, filter, {
       authorId: profile.id,
       includeCommentActivity: true,
-      before,
+      before: candidateBefore,
       fetchLimit: Math.min(80, Math.max(40, limit + offset + 20))
     });
-    return { ...pageResult(items, limit, pageOffset), sort, total: items.length };
+    return {
+      ...pageResult(orderFeedItems(items, sort), limit, pageOffset),
+      sort,
+      total: items.length
+    };
   }
 
   if (kind === 'scope') {
@@ -1227,9 +1265,13 @@ export async function handleFeedPage(
       scopeKind,
       scopeId: scopeRow.id,
       includePrivateEvents: true,
-      before
+      before: candidateBefore
     });
-    return { ...pageResult(items, limit, pageOffset), sort, total: items.length };
+    return {
+      ...pageResult(orderFeedItems(items, sort), limit, pageOffset),
+      sort,
+      total: items.length
+    };
   }
 
   if (kind === 'region') {

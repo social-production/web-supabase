@@ -37,15 +37,6 @@ const DEFAULT_PROJECT_PHASE_COPY: Record<string, PhaseCopy> = {
       'The approved plan sets how the community shares or accesses what the project produces.'
     ]
   },
-  'phase-4': {
-    summary: 'Prepare inventory, materials, and acquisition steps before execution.',
-    mechanics: [
-      'Track what must be acquired or prepared before the project can execute at scale.',
-      'Inventory and acquisition requests can be raised and voted on by members.',
-      'This phase bridges planning and live activity for projects that need physical or staged setup.',
-      'Advance when acquisition gates defined by the project are satisfied.'
-    ]
-  },
   'phase-5': {
     summary: 'Schedule and run the activities that deliver the approved plan.',
     mechanics: [
@@ -53,15 +44,6 @@ const DEFAULT_PROJECT_PHASE_COPY: Record<string, PhaseCopy> = {
       'Members commit to roles; calendar color reflects whether minimums are met.',
       'Service requests and direct bookings may be available depending on the approved plan.',
       'Activities continue until the project is ready to close or convert.'
-    ]
-  },
-  'phase-6': {
-    summary: 'Confirm execution is complete and ready for final closure.',
-    mechanics: [
-      'Outstanding activities and execution items are reviewed before the project closes.',
-      'Members can vote on whether execution obligations have been met.',
-      'This phase prevents premature closure while work is still in progress.',
-      'Advance to Closed once execution is confirmed or the community votes to close.'
     ]
   },
   'phase-7': {

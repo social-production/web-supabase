@@ -195,7 +195,8 @@ async function handleRequest(
     if (req.method === 'GET' && path === '/search') {
       const q = url.searchParams.get('q') ?? '';
       const limit = Number(url.searchParams.get('limit') ?? 20);
-      return json(await handleSearch(db, userId, q, limit));
+      const entityTypes = url.searchParams.getAll('entity_types');
+      return json(await handleSearch(db, userId, q, limit, entityTypes));
     }
 
     // Scopes
@@ -421,11 +422,12 @@ async function handleRequest(
         .from('messages')
         .select('id, sender_id, encrypted_body, created_at, moderation_state')
         .eq('conversation_id', conversationId)
-        .order('created_at', { ascending: true })
+        .order('created_at', { ascending: false })
         .limit(limit);
+      const orderedMessages = [...(msgs ?? [])].reverse();
       return json({
         conversationId,
-        messages: (msgs ?? []).map((m) => {
+        messages: orderedMessages.map((m) => {
           const sender = participantById.get(m.sender_id) ?? {
             id: m.sender_id,
             username: 'unknown',
@@ -1326,6 +1328,18 @@ async function handleRequest(
         if (action === 'phase/advance') return json(await mutations.advanceProjectPhase(db, userId, slug, body.closeNote));
         if (action === 'phase/revert') return json(await mutations.requestProjectPhaseRevert(db, userId, slug, body));
         if (action === 'production-plans') return json(await mutations.addProjectProductionPlan(db, userId, slug, body));
+        const productionPlanUpdate = action.match(/^production-plans\/([^/]+)$/);
+        if (productionPlanUpdate) {
+          return json(
+            await mutations.updateProjectProductionPlan(
+              db,
+              userId,
+              slug,
+              productionPlanUpdate[1],
+              body
+            )
+          );
+        }
         if (action === 'distribution-plans') return json(await mutations.addProjectProductionPlan(db, userId, slug, { ...body, phase: 'distribution' }));
         if (action === 'share') return json(await mutations.shareEntityWithUser(db, userId, 'project', slug, body.username));
         if (action === 'values/importance') {
@@ -1463,7 +1477,16 @@ async function handleRequest(
           );
         }
         if (action === 'activities/rating') {
-          return json(await lifecycle.upsertActivityRating(db, userId, 'project', body.activityId, body.rating));
+          return json(
+            await lifecycle.upsertActivityRating(
+              db,
+              userId,
+              'project',
+              body.activityId,
+              body.rating,
+              body.comment
+            )
+          );
         }
         if (action === 'activities/rating/delete') {
           await db
@@ -1765,7 +1788,16 @@ async function handleRequest(
           );
         }
         if (action === 'activities/rating') {
-          return json(await lifecycle.upsertActivityRating(db, userId, 'event', body.activityId, body.rating));
+          return json(
+            await lifecycle.upsertActivityRating(
+              db,
+              userId,
+              'event',
+              body.activityId,
+              body.rating,
+              body.comment
+            )
+          );
         }
         if (action === 'activities/rating/delete') {
           await db
@@ -1845,6 +1877,14 @@ async function handleRequest(
     }
     if (message === 'forbidden' || message === 'direct_invite_closed_only' || message === 'username_required' || message === 'invalid_vote' || message === 'role_full') {
       return error(message, message === 'forbidden' || message === 'role_full' ? 403 : 422);
+    }
+    if (
+      message === 'invalid_phase' ||
+      message === 'signal_gate_locked' ||
+      message === 'plan_gate_locked' ||
+      message === 'personal_service_governance_disabled'
+    ) {
+      return error(message, 422);
     }
     if (message === 'cannot_follow_self') {
       return error(message, 400);

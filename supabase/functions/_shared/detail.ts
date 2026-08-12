@@ -5,6 +5,11 @@
  */
 import type { SupabaseClient } from 'https://esm.sh/@supabase/supabase-js@2.49.1';
 import { eventPhaseCopy, projectPhaseCopy } from './lifecycle_copy.ts';
+import {
+  nextPhaseIdForProject,
+  visiblePhaseIdForProject,
+  visiblePhaseIdsForProject
+} from './phases.ts';
 import { eventPopulation, isPlatformEvent, projectPopulation, requiredVotes, summarizeVotes } from './votes.ts';
 
 function emptySignalSummary(
@@ -67,28 +72,12 @@ const PROJECT_PHASES = [
     projectStatus: 'Planning'
   },
   {
-    id: 'phase-4',
-    order: 4,
-    shortLabel: '4',
-    title: 'Acquisition',
-    summary: 'Acquire materials and assets.',
-    projectStatus: 'Acquisition'
-  },
-  {
     id: 'phase-5',
     order: 5,
     shortLabel: '5',
     title: 'Activity',
     summary: 'Run the work.',
     projectStatus: 'Active'
-  },
-  {
-    id: 'phase-6',
-    order: 6,
-    shortLabel: '6',
-    title: 'Review',
-    summary: 'Review outcomes.',
-    projectStatus: 'Review'
   },
   {
     id: 'phase-7',
@@ -138,11 +127,10 @@ const EVENT_PHASES = [
 function progressState(
   currentOrder: number,
   order: number
-): 'complete' | 'current' | 'upcoming' | 'locked' {
+): 'complete' | 'current' | 'upcoming' {
   if (order < currentOrder) return 'complete';
   if (order === currentOrder) return 'current';
-  if (order === currentOrder + 1) return 'upcoming';
-  return 'locked';
+  return 'upcoming';
 }
 
 async function loadSignalState(
@@ -1151,6 +1139,111 @@ async function hydrateProjectRevertHistory(db: SupabaseClient, projectId: string
   });
 }
 
+async function hydrateProjectRequestSystem(
+  db: SupabaseClient,
+  projectId: string,
+  userId: string | null,
+  viewerIsMember: boolean,
+  viewerIsManager: boolean,
+  projectMode: string,
+  population: number
+) {
+  const [{ data: settings }, { data: requests }, { data: changes }] = await Promise.all([
+    db
+      .from('project_service_request_settings')
+      .select('*')
+      .eq('project_id', projectId)
+      .maybeSingle(),
+    db
+      .from('project_service_requests')
+      .select(
+        'id, title, body, requester_id, status, scheduled_at, ends_at, linked_activity_id, created_at, users!fk_project_service_requests_requester_id_users(username)'
+      )
+      .eq('project_id', projectId)
+      .order('created_at', { ascending: false })
+      .limit(100),
+    db
+      .from('project_service_request_setting_changes')
+      .select(
+        'id, reason, author_id, enabled, request_mode, allow_off_schedule_requests, created_at, users!fk_project_service_request_setting_changes_author_id_users(username)'
+      )
+      .eq('project_id', projectId)
+      .eq('status', 'open')
+      .order('created_at', { ascending: false })
+  ]);
+  const changeIds = (changes ?? []).map((change) => String(change.id));
+  const votesByRequest = new Map<string, Array<{ vote?: string | null; voter_id?: string }>>();
+  if (changeIds.length) {
+    const { data: votes } = await db
+      .from('project_service_request_setting_change_votes')
+      .select('request_id, voter_id, vote')
+      .in('request_id', changeIds);
+    for (const vote of votes ?? []) {
+      const requestId = String(vote.request_id);
+      const rows = votesByRequest.get(requestId) ?? [];
+      rows.push({ vote: vote.vote, voter_id: vote.voter_id });
+      votesByRequest.set(requestId, rows);
+    }
+  }
+  const enabled = Boolean(settings?.enabled);
+  const requestMode = String(settings?.request_mode ?? 'both');
+  return {
+    enabled,
+    requestCount: (requests ?? []).length,
+    requests: (requests ?? []).map((request) => {
+      const requester = Array.isArray(request.users) ? request.users[0] : request.users;
+      return {
+        id: request.id,
+        title: request.title,
+        body: request.body,
+        requesterUsername: requester?.username ?? 'unknown',
+        createdAt: request.created_at,
+        status: request.status,
+        scheduledAt: request.scheduled_at ?? undefined,
+        endsAt: request.ends_at ?? undefined,
+        linkedActivityId: request.linked_activity_id ?? null
+      };
+    }),
+    viewerCanSubmitRequests: Boolean(userId) && enabled,
+    viewerCanReviewRequests: viewerIsManager,
+    viewerCanRequestSettingsChanges:
+      viewerIsMember && projectMode !== 'personal-service',
+    viewerCanVoteOnSettingsChanges:
+      viewerIsMember && projectMode !== 'personal-service',
+    requiresSchedule: requestMode === 'calendar',
+    settings: {
+      enabled,
+      requestMode,
+      allowOffScheduleRequests: Boolean(settings?.allow_off_schedule_requests),
+      summary: String(settings?.summary ?? '')
+    },
+    settingsChangeRequests: (changes ?? []).map((change) => {
+      const author = Array.isArray(change.users) ? change.users[0] : change.users;
+      const { summary, passes, canStillPass } = buildGovernanceVoteSummary(
+        votesByRequest.get(String(change.id)) ?? [],
+        userId,
+        population
+      );
+      return {
+        id: change.id,
+        reason: change.reason,
+        authorUsername: author?.username ?? 'unknown',
+        createdAt: change.created_at,
+        proposedSettings: {
+          enabled: Boolean(change.enabled),
+          requestMode: change.request_mode,
+          allowOffScheduleRequests: Boolean(change.allow_off_schedule_requests),
+          summary: ''
+        },
+        approvalThresholdPercent: 66,
+        voteSummary: summary,
+        passesApprovalThreshold: passes,
+        canStillPass
+      };
+    })
+  };
+}
+
 async function hydrateEventPhaseChangeRequests(
   db: SupabaseClient,
   eventId: string,
@@ -1211,7 +1304,7 @@ export async function buildProjectLifecycle(
   viewerIsMember: boolean,
   activities: unknown[]
 ) {
-  const currentPhaseId = String(project.current_phase_id ?? 'phase-1') as
+  const storedCurrentPhaseId = String(project.current_phase_id ?? 'phase-1') as
     | 'phase-1'
     | 'phase-2'
     | 'phase-3'
@@ -1219,8 +1312,25 @@ export async function buildProjectLifecycle(
     | 'phase-5'
     | 'phase-6'
     | 'phase-7';
-  const currentOrder = PROJECT_PHASES.find((p) => p.id === currentPhaseId)?.order ?? 1;
-  const next = PROJECT_PHASES.find((p) => p.order === currentOrder + 1) ?? null;
+  const projectMode = String(project.project_mode ?? 'productive');
+  const projectSubtype = project.project_subtype ? String(project.project_subtype) : null;
+  const visiblePhaseIds = visiblePhaseIdsForProject(projectMode, projectSubtype);
+  const visiblePhases = visiblePhaseIds
+    .map((phaseId, index) => {
+      const phase = PROJECT_PHASES.find((candidate) => candidate.id === phaseId);
+      return phase ? { ...phase, order: index + 1, shortLabel: String(index + 1) } : null;
+    })
+    .filter((phase): phase is NonNullable<typeof phase> => Boolean(phase));
+  const currentPhaseId = visiblePhaseIdForProject(
+    projectMode,
+    projectSubtype,
+    storedCurrentPhaseId
+  ) as typeof storedCurrentPhaseId;
+  const currentOrder = visiblePhases.find((phase) => phase.id === currentPhaseId)?.order ?? 1;
+  const nextPhaseId = nextPhaseIdForProject(projectMode, projectSubtype, storedCurrentPhaseId);
+  const next = nextPhaseId
+    ? visiblePhases.find((phase) => phase.id === nextPhaseId) ?? null
+    : null;
   const usesPlatformVoteContext = Boolean(project.is_platform_tagged);
   const population = await projectPopulation(db, String(project.id));
   const quorumVotesRequired = requiredVotes(Math.max(0, population));
@@ -1286,9 +1396,29 @@ export async function buildProjectLifecycle(
   const softwareGovernance = isSoftware
     ? await hydrateSoftwareGovernance(db, project, userId, viewerIsMember, population)
     : null;
+  const { data: viewerMembership } = userId
+    ? await db
+        .from('project_memberships')
+        .select('is_manager')
+        .eq('project_id', String(project.id))
+        .eq('user_id', userId)
+        .maybeSingle()
+    : { data: null };
+  const viewerIsManager =
+    Boolean(userId) &&
+    (String(project.author_id ?? '') === userId || Boolean(viewerMembership?.is_manager));
+  const requestSystem = await hydrateProjectRequestSystem(
+    db,
+    String(project.id),
+    userId,
+    viewerIsMember,
+    viewerIsManager,
+    projectMode,
+    population
+  );
 
   return {
-    projectMode: project.project_mode ?? 'productive',
+    projectMode,
     currentSubtype: project.project_subtype ?? null,
     currentSubtypeLabel: project.project_subtype ?? null,
     usesPlatformLifecycle: true,
@@ -1300,14 +1430,23 @@ export async function buildProjectLifecycle(
     voteContextLabel,
     voteContextPopulation: population,
     notes: [],
-    phases: PROJECT_PHASES.map((phase) => {
+    phases: visiblePhases.map((phase) => {
       const copy = projectPhaseCopy(
         phase.id,
         String(project.project_mode ?? 'productive'),
         phase.summary
       );
+      const title =
+        projectMode === 'personal-service' && phase.id === 'phase-1'
+          ? 'Activity'
+          : projectMode === 'personal-service' && phase.id === 'phase-2'
+            ? 'Closed'
+            : projectMode === 'collective-service' && phase.id === 'phase-2'
+              ? 'Operations plan'
+              : phase.title;
       return {
         ...phase,
+        title,
         summary: copy.summary || phase.summary,
         progressState: progressState(currentOrder, phase.order),
         mechanics: copy.mechanics,
@@ -1315,40 +1454,27 @@ export async function buildProjectLifecycle(
         betaLocked: false
       };
     }),
-    viewerCanRequestPhaseChanges: viewerIsMember,
-    viewerCanVoteOnPhaseChanges: viewerIsMember,
+    viewerCanRequestPhaseChanges: viewerIsMember && projectMode !== 'personal-service',
+    viewerCanVoteOnPhaseChanges: viewerIsMember && projectMode !== 'personal-service',
     phaseChangeRequests,
-    viewerCanAdvancePhase: false,
+    viewerCanAdvancePhase: viewerIsManager,
     nextPhaseId: next?.id ?? null,
     nextPhaseLabel: next?.title ?? null,
-    viewerCanRevertPhase: false,
-    revertablePhaseIds: PROJECT_PHASES.filter((p) => p.order < currentOrder && p.order <= 3).map(
-      (p) => p.id
-    ),
+    viewerCanRevertPhase: viewerIsManager && projectMode !== 'personal-service',
+    revertablePhaseIds: visiblePhases
+      .filter((phase) => phase.order < currentOrder && phase.id !== 'phase-7')
+      .map((phase) => phase.id),
     revertHistory,
-    requestSystem: {
-      enabled: false,
-      requestCount: 0,
-      requests: [],
-      viewerCanSubmitRequests: false,
-      viewerCanReviewRequests: false,
-      viewerCanRequestSettingsChanges: false,
-      viewerCanVoteOnSettingsChanges: false,
-      requiresSchedule: false,
-      settings: {
-        enabled: false,
-        requestMode: 'both',
-        note: ''
-      },
-      settingsChangeRequests: []
-    },
+    requestSystem,
     personalService:
       project.project_mode === 'personal-service'
         ? {
-            availabilitySummary: '',
+            availabilitySummary: requestSystem.settings.summary,
             travelRadiusLabel: '',
-            usesCalendar: false,
-            requestMode: 'both'
+            usesCalendar:
+              requestSystem.settings.requestMode === 'calendar' ||
+              requestSystem.settings.requestMode === 'both',
+            requestMode: requestSystem.settings.requestMode
           }
         : null,
     phaseOne: {

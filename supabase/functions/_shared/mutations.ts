@@ -10,6 +10,11 @@ import {
   isScopeMember
 } from './access.ts';
 import { applyProjectClose } from './conversion.ts';
+import {
+  ensureEventAdvanceAllowed,
+  ensureProjectAdvanceAllowed,
+  resolveProjectSubtype
+} from './lifecycleGates.ts';
 import { displayStageLabel, nextPhaseIdForProject } from './phases.ts';
 import { recordMeaningfulAction } from './votes.ts';
 
@@ -467,6 +472,16 @@ export async function commitHelpRole(
 export async function addProjectValue(db: SupabaseClient, userId: string, slug: string, label: string) {
   const project = await getProjectBySlug(db, slug);
   if (!project) throw new Error('not_found');
+  if (
+    String(project.project_mode) === 'personal-service' ||
+    !(await isProjectMember(db, project.id, userId))
+  ) {
+    throw new Error(
+      String(project.project_mode) === 'personal-service'
+        ? 'personal_service_governance_disabled'
+        : 'forbidden'
+    );
+  }
   await db.from('project_values').insert({
     project_id: project.id,
     label,
@@ -557,9 +572,18 @@ export async function requestProjectPhaseChange(
 ) {
   const project = await getProjectBySlug(db, slug);
   if (!project) throw new Error('not_found');
+  if (String(project.project_mode) === 'personal-service') {
+    throw new Error('personal_service_governance_disabled');
+  }
   const targetPhaseId = String(body.targetPhaseId ?? body.target_phase_id ?? '');
   if (!targetPhaseId) throw new Error('invalid_phase');
+  if (targetPhaseId === 'phase-4' || targetPhaseId === 'phase-6') {
+    throw new Error('invalid_phase');
+  }
   const changeKind = String(body.changeKind ?? body.change_kind ?? 'advance');
+  if (changeKind === 'advance' || changeKind === 'close') {
+    await ensureProjectAdvanceAllowed(db, project, targetPhaseId);
+  }
   const { data: openExisting } = await db
     .from('project_phase_change_requests')
     .select('id')
@@ -690,6 +714,10 @@ export async function requestEventPhaseChange(
     return { ok: true, id: approved.id, applied: true, currentPhaseId: targetPhaseId };
   }
 
+  if (targetOrder > currentOrder) {
+    await ensureEventAdvanceAllowed(db, event, targetPhaseId);
+  }
+
   const { data: openExisting } = await db
     .from('event_phase_change_requests')
     .select('id')
@@ -738,9 +766,12 @@ export async function advanceProjectPhase(
   }
 
   const currentPhaseId = String(project.current_phase_id);
-  const subtype = project.project_subtype != null ? String(project.project_subtype) : null;
+  const subtype = await resolveProjectSubtype(db, project);
   const next = nextPhaseIdForProject(String(project.project_mode), subtype, currentPhaseId);
   if (!next) throw new Error('conflict');
+  if (String(project.project_mode) !== 'personal-service') {
+    await ensureProjectAdvanceAllowed(db, project, next);
+  }
 
   const note = String(closeNote || '').trim();
   if (next === 'phase-7' && !note) throw new Error('close_note_required');
@@ -795,6 +826,16 @@ export async function addProjectProductionPlan(
 ) {
   const project = await getProjectBySlug(db, slug);
   if (!project) throw new Error('not_found');
+  if (
+    String(project.project_mode) === 'personal-service' ||
+    !(await isProjectMember(db, project.id, userId))
+  ) {
+    throw new Error(
+      String(project.project_mode) === 'personal-service'
+        ? 'personal_service_governance_disabled'
+        : 'forbidden'
+    );
+  }
   const rawPhase = String(input.phase ?? input.phaseKind ?? input.phase_kind ?? 'production');
   const phaseKind =
     rawPhase === 'distribution' ? 'distribution' : rawPhase === 'organisation' ? 'organisation' : 'production';
@@ -817,6 +858,47 @@ export async function addProjectProductionPlan(
     .single();
   if (error) throw error;
   return { ok: true, id: data.id };
+}
+
+export async function updateProjectProductionPlan(
+  db: SupabaseClient,
+  userId: string,
+  slug: string,
+  planId: string,
+  input: Record<string, unknown>
+) {
+  const project = await getProjectBySlug(db, slug);
+  if (!project) throw new Error('not_found');
+  if (String(project.project_mode) === 'personal-service') {
+    throw new Error('personal_service_governance_disabled');
+  }
+  const { data: plan } = await db
+    .from('project_plans')
+    .select('id, author_id, plan_payload')
+    .eq('id', planId)
+    .eq('project_id', project.id)
+    .maybeSingle();
+  if (!plan) throw new Error('not_found');
+  if (plan.author_id !== userId) throw new Error('forbidden');
+  const planPayload = {
+    ...((plan.plan_payload ?? {}) as Record<string, unknown>),
+    ...input
+  };
+  const { error } = await db
+    .from('project_plans')
+    .update({
+      title: input.title ?? undefined,
+      description: input.description ?? undefined,
+      project_subtype: input.projectSubtype ?? input.project_subtype ?? undefined,
+      repository_url: input.repositoryUrl ?? input.repository_url ?? undefined,
+      demand_consideration_note: input.demandConsiderationNote ?? undefined,
+      total_cost_label: input.totalCostLabel ?? undefined,
+      location_id: input.locationId ?? input.location_id ?? undefined,
+      plan_payload: planPayload
+    })
+    .eq('id', planId);
+  if (error) throw error;
+  return { ok: true, id: planId };
 }
 
 export async function addEventPlan(

@@ -384,9 +384,15 @@ export async function handleAddComment(
       .eq('id', body.subject_id)
       .maybeSingle();
     if (subject) {
+      const patch: Record<string, unknown> = {
+        comment_count: Number(subject.comment_count ?? 0) + 1
+      };
+      if (subjectTable !== 'posts') {
+        patch.last_activity_at = new Date().toISOString();
+      }
       await db
         .from(subjectTable)
-        .update({ comment_count: Number(subject.comment_count ?? 0) + 1 })
+        .update(patch)
         .eq('id', body.subject_id);
     }
   }
@@ -496,7 +502,13 @@ export async function handleMarkAllNotificationsRead(db: SupabaseClient, userId:
   return { ok: true };
 }
 
-export async function handleSearch(db: SupabaseClient, userId: string | null, query: string, limit = 20) {
+export async function handleSearch(
+  db: SupabaseClient,
+  userId: string | null,
+  query: string,
+  limit = 20,
+  entityTypes: string[] = []
+) {
   if (!query.trim()) {
     return {
       query,
@@ -506,11 +518,14 @@ export async function handleSearch(db: SupabaseClient, userId: string | null, qu
     };
   }
 
-  const { data } = await db
+  let searchQuery = db
     .from('searchable_documents')
     .select('id, entity_type, entity_id, title, summary, href, meta')
-    .textSearch('search_vector', query, { type: 'websearch', config: 'english' })
-    .limit(Math.min(limit * 3, 60));
+    .textSearch('search_vector', query, { type: 'websearch', config: 'english' });
+  if (entityTypes.length) {
+    searchQuery = searchQuery.in('entity_type', entityTypes);
+  }
+  const { data } = await searchQuery.limit(Math.min(limit * 3, 60));
 
   const kindMap: Record<string, string> = {
     project: 'project',

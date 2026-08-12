@@ -47,6 +47,33 @@ function skipsDistributionPhase(
   return projectMode === 'collective-service' || projectSubtype === 'software';
 }
 
+export function visiblePhaseIdsForProject(
+  projectMode: string,
+  projectSubtype: string | null | undefined
+): string[] {
+  if (projectMode === 'personal-service') {
+    return ['phase-1', 'phase-2'];
+  }
+  return skipsDistributionPhase(projectMode, projectSubtype)
+    ? ['phase-1', 'phase-2', 'phase-5', 'phase-7']
+    : ['phase-1', 'phase-2', 'phase-3', 'phase-5', 'phase-7'];
+}
+
+export function visiblePhaseIdForProject(
+  projectMode: string,
+  projectSubtype: string | null | undefined,
+  phaseId: string
+): string {
+  const visible = visiblePhaseIdsForProject(projectMode, projectSubtype);
+  if (visible.includes(phaseId)) return phaseId;
+  const phaseOrder = PHASE_ORDER[phaseId] ?? 1;
+  return (
+    [...visible]
+      .reverse()
+      .find((candidate) => (PHASE_ORDER[candidate] ?? 0) <= phaseOrder) ?? visible[0]
+  );
+}
+
 export function nextPhaseIdForProject(
   projectMode: string,
   projectSubtype: string | null | undefined,
