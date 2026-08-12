@@ -49,6 +49,16 @@ for i in $(seq 1 30); do
   sleep 1
 done
 
+curl -fsS -D /tmp/sp-health-headers.txt "${auth_hdr[@]}" \
+  "${FUNCTIONS_URL}/gateway/healthz" >/tmp/sp-health-instrumented.json
+python3 - <<'PY'
+from pathlib import Path
+headers = Path('/tmp/sp-health-headers.txt').read_text().lower()
+assert '\nx-request-id:' in headers
+assert '\nserver-timing:' in headers
+PY
+pass request-instrumentation
+
 echo "== anonymous bootstrap + feeds =="
 curl -fsS "${auth_hdr[@]}" "${FUNCTIONS_URL}/gateway/bootstrap" >/tmp/sp-bootstrap.json
 python3 -c "import json; d=json.load(open('/tmp/sp-bootstrap.json')); assert 'unreadCounts' in d; assert d.get('directory',{}).get('platform',{}).get('slug')=='platform'; assert d.get('directory',{}).get('channels')==[]; assert d.get('directory',{}).get('communities')==[]"
@@ -606,6 +616,10 @@ curl -fsS -X POST "${user_a[@]}" "${FUNCTIONS_URL}/gateway/content/posts" \
 POST_ID=$(python3 -c "import json; print(json.load(open('/tmp/sp-post.json'))['id'])")
 curl -fsS "${user_a[@]}" "${FUNCTIONS_URL}/gateway/feeds/personal?scope=following&limit=20" >/tmp/sp-personal.json
 python3 -c "import json; d=json.load(open('/tmp/sp-personal.json')); assert 'items' in d and isinstance(d['items'], list); assert any(i.get('id')=='${POST_ID}' or i.get('id')=='${THREAD_ID}' or i.get('slug')=='${SLUG}' for i in d['items'])"
+curl -fsS "${user_a[@]}" "${FUNCTIONS_URL}/gateway/bootstrap/summary" >/tmp/sp-bootstrap-summary.json
+python3 -c "import json; d=json.load(open('/tmp/sp-bootstrap-summary.json')); assert set(d.get('unreadCounts',{})) == {'notifications','messages'}"
+curl -fsS "${user_a[@]}" "${FUNCTIONS_URL}/gateway/messages/linked-chats" >/tmp/sp-linked-chats.json
+python3 -c "import json; d=json.load(open('/tmp/sp-linked-chats.json')); assert isinstance(d.get('items'), list)"
 curl -fsS "${user_a[@]}" "${FUNCTIONS_URL}/gateway/users/${USER_A}" >/tmp/sp-profile.json
 python3 -c "import json; d=json.load(open('/tmp/sp-profile.json')); assert d.get('followersCount') is not None; assert d.get('followingCount') is not None; assert 'isOwnProfile' in d; assert isinstance(d.get('feed'), list)"
 pass personal-profile

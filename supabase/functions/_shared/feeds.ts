@@ -11,6 +11,7 @@ import {
   viewerFollowsAuthor
 } from './access.ts';
 import { loadActiveReport, loadActiveReportsByTargetIds, moderationFieldsFromRow } from './moderation.ts';
+import { measureServerSpan } from './performance.ts';
 
 type VoteDirection = -1 | 0 | 1;
 
@@ -350,9 +351,10 @@ async function mapThread(
   db: SupabaseClient,
   userId: string | null,
   thread: any,
-  enrichment?: FeedEnrichment
+  enrichment?: FeedEnrichment,
+  accessPrechecked = false
 ) {
-  if (!(await canViewByTags(db, userId, 'thread', thread.id))) return null;
+  if (!accessPrechecked && !(await canViewByTags(db, userId, 'thread', thread.id))) return null;
   const author = Array.isArray(thread.users) ? thread.users[0] : thread.users;
   const tags = await resolveTags(db, 'thread', thread.id, enrichment);
   const report = await resolveReport(db, 'thread', thread.id, userId, enrichment);
@@ -381,9 +383,10 @@ async function mapPost(
   userId: string | null,
   post: any,
   feedSource?: string,
-  enrichment?: FeedEnrichment
+  enrichment?: FeedEnrichment,
+  accessPrechecked = false
 ) {
-  if (!(await canViewPost(db, userId, post))) return null;
+  if (!accessPrechecked && !(await canViewPost(db, userId, post))) return null;
   const author = Array.isArray(post.users) ? post.users[0] : post.users;
   const report = await resolveReport(db, 'post', post.id, userId, enrichment);
   return {
@@ -416,37 +419,18 @@ async function fetchLatestUpdates(
   eventIds: string[]
 ) {
   const latest = new Map<string, { body: string; createdAt: string }>();
+  if (!projectIds.length && !eventIds.length) return latest;
 
-  if (projectIds.length) {
-    const { data } = await db
-      .from('project_updates')
-      .select('project_id, body, created_at')
-      .in('project_id', projectIds)
-      .order('created_at', { ascending: false });
-    for (const row of data ?? []) {
-      const key = `project:${row.project_id}`;
-      if (latest.has(key)) continue;
-      latest.set(key, {
-        body: truncateUpdateBody(String(row.body ?? '')),
-        createdAt: String(row.created_at)
-      });
-    }
-  }
-
-  if (eventIds.length) {
-    const { data } = await db
-      .from('event_updates')
-      .select('event_id, body, created_at')
-      .in('event_id', eventIds)
-      .order('created_at', { ascending: false });
-    for (const row of data ?? []) {
-      const key = `event:${row.event_id}`;
-      if (latest.has(key)) continue;
-      latest.set(key, {
-        body: truncateUpdateBody(String(row.body ?? '')),
-        createdAt: String(row.created_at)
-      });
-    }
+  const { data, error } = await db.rpc('get_latest_feed_updates', {
+    p_project_ids: projectIds,
+    p_event_ids: eventIds
+  });
+  if (error) throw error;
+  for (const row of (data ?? []) as Array<Record<string, unknown>>) {
+    latest.set(`${row.entity_type}:${row.entity_id}`, {
+      body: truncateUpdateBody(String(row.body ?? '')),
+      createdAt: String(row.created_at)
+    });
   }
 
   return latest;
@@ -457,9 +441,10 @@ async function mapProject(
   userId: string | null,
   project: any,
   latestUpdate?: { body: string; createdAt: string } | null,
-  enrichment?: FeedEnrichment
+  enrichment?: FeedEnrichment,
+  accessPrechecked = false
 ) {
-  if (!(await canViewByTags(db, userId, 'project', project.id))) return null;
+  if (!accessPrechecked && !(await canViewByTags(db, userId, 'project', project.id))) return null;
   const author = Array.isArray(project.users) ? project.users[0] : project.users;
   const tags = await resolveTags(db, 'project', project.id, enrichment);
   const signals = await resolveSignals(
@@ -518,10 +503,11 @@ async function mapEvent(
   userId: string | null,
   event: any,
   latestUpdate?: { body: string; createdAt: string } | null,
-  enrichment?: FeedEnrichment
+  enrichment?: FeedEnrichment,
+  accessPrechecked = false
 ) {
-  if (!(await canViewPrivateEvent(db, userId, event))) return null;
-  if (!event.is_private && !(await canViewByTags(db, userId, 'event', event.id))) return null;
+  if (!accessPrechecked && !(await canViewPrivateEvent(db, userId, event))) return null;
+  if (!accessPrechecked && !event.is_private && !(await canViewByTags(db, userId, 'event', event.id))) return null;
   const author = Array.isArray(event.users) ? event.users[0] : event.users;
   const tags = await resolveTags(db, 'event', event.id, enrichment);
   const signals = await resolveSignals(
@@ -577,9 +563,10 @@ async function mapHelp(
   db: SupabaseClient,
   userId: string | null,
   request: any,
-  enrichment?: FeedEnrichment
+  enrichment?: FeedEnrichment,
+  accessPrechecked = false
 ) {
-  if (!(await canViewByTags(db, userId, 'help_request', request.id))) return null;
+  if (!accessPrechecked && !(await canViewByTags(db, userId, 'help_request', request.id))) return null;
   const author = Array.isArray(request.users) ? request.users[0] : request.users;
   const tags = await resolveTags(db, 'help_request', request.id, enrichment);
   const report = await resolveReport(db, 'help_request', request.id, userId, enrichment);
@@ -658,15 +645,23 @@ async function mapCommentActivity(
   db: SupabaseClient,
   userId: string | null,
   comment: any,
-  feedSource?: string
+  feedSource?: string,
+  context?: Map<
+    string,
+    { subjectTitle: string; subjectSlug: string | null; replyCount: number; visible: boolean }
+  >,
+  enrichment?: FeedEnrichment
 ) {
   if (comment.moderation_state === 'removed') return null;
   const subjectType = String(comment.subject_type ?? '');
   const subjectId = String(comment.subject_id ?? '');
   if (!subjectType || !subjectId) return null;
 
-  // Respect the same visibility rules as the subject itself.
-  if (subjectType === 'post') {
+  const summary = context?.get(String(comment.id));
+  if (context && !summary?.visible) return null;
+
+  // Non-feed callers retain the standalone visibility checks.
+  if (!context && subjectType === 'post') {
     const { data: post } = await db
       .from('posts')
       .select('id, body, author_id, audience, moderation_state')
@@ -674,7 +669,7 @@ async function mapCommentActivity(
       .maybeSingle();
     if (!post || post.moderation_state === 'removed') return null;
     if (!(await canViewPost(db, userId, post))) return null;
-  } else if (subjectType === 'event') {
+  } else if (!context && subjectType === 'event') {
     const { data: event } = await db
       .from('events')
       .select(
@@ -685,20 +680,23 @@ async function mapCommentActivity(
     if (!event || event.moderation_state === 'removed') return null;
     if (!(await canViewPrivateEvent(db, userId, event))) return null;
     if (!event.is_private && !(await canViewByTags(db, userId, 'event', event.id))) return null;
-  } else if (subjectType === 'thread' || subjectType === 'project' || subjectType === 'help_request') {
+  } else if (
+    !context &&
+    (subjectType === 'thread' || subjectType === 'project' || subjectType === 'help_request')
+  ) {
     if (!(await canViewEntity(db, userId, subjectType, subjectId))) return null;
-  } else {
+  } else if (!context) {
     return null;
   }
 
-  let subjectTitle = 'Untitled';
-  let slug: string | null = null;
-  if (subjectType === 'thread') {
+  let subjectTitle = summary?.subjectTitle ?? 'Untitled';
+  let slug: string | null = summary?.subjectSlug ?? null;
+  if (!context && subjectType === 'thread') {
     const { data } = await db.from('threads').select('slug, title, moderation_state').eq('id', subjectId).maybeSingle();
     if (!data || data.moderation_state === 'removed') return null;
     subjectTitle = data.title ?? subjectTitle;
     slug = data.slug ?? null;
-  } else if (subjectType === 'project') {
+  } else if (!context && subjectType === 'project') {
     const { data } = await db
       .from('projects')
       .select('slug, title, is_closed, moderation_state')
@@ -707,26 +705,30 @@ async function mapCommentActivity(
     if (!data || data.moderation_state === 'removed' || data.is_closed) return null;
     subjectTitle = data.title ?? subjectTitle;
     slug = data.slug ?? null;
-  } else if (subjectType === 'event') {
+  } else if (!context && subjectType === 'event') {
     const { data } = await db.from('events').select('slug, title, moderation_state').eq('id', subjectId).maybeSingle();
     if (!data || data.moderation_state === 'removed') return null;
     subjectTitle = data.title ?? subjectTitle;
     slug = data.slug ?? null;
-  } else if (subjectType === 'help_request') {
+  } else if (!context && subjectType === 'help_request') {
     const { data } = await db.from('help_requests').select('title, moderation_state').eq('id', subjectId).maybeSingle();
     if (!data || data.moderation_state === 'removed') return null;
     subjectTitle = data.title ?? subjectTitle;
-  } else if (subjectType === 'post') {
+  } else if (!context && subjectType === 'post') {
     const { data } = await db.from('posts').select('body, moderation_state').eq('id', subjectId).maybeSingle();
     if (!data || data.moderation_state === 'removed') return null;
     subjectTitle = String(data.body ?? '').slice(0, 120) || 'Post';
   }
 
   const author = Array.isArray(comment.users) ? comment.users[0] : comment.users;
-  const { count: replyCount } = await db
-    .from('comments')
-    .select('id', { count: 'exact', head: true })
-    .eq('parent_id', comment.id);
+  const replyCount = summary
+    ? summary.replyCount
+    : (
+        await db
+          .from('comments')
+          .select('id', { count: 'exact', head: true })
+          .eq('parent_id', comment.id)
+      ).count;
 
   return {
     kind: 'comment-activity',
@@ -749,35 +751,45 @@ async function mapCommentActivity(
     commentExcerpt: comment.body ?? '',
     voteTargetId: comment.id,
     voteCount: comment.vote_count ?? 0,
-    activeVote: await viewerVote(db, userId, 'comment', comment.id),
+    activeVote: await resolveVote(db, userId, 'comment', comment.id, enrichment),
     commentCount: replyCount ?? 0,
     feedSource,
     lastActivityAt: comment.created_at,
-    ...mapModeration(comment, await loadActiveReport(db, 'comment', comment.id, userId))
+    ...mapModeration(
+      comment,
+      await resolveReport(db, 'comment', comment.id, userId, enrichment)
+    )
   };
 }
 
 function pageResult(items: unknown[], limit: number, offset: number) {
   const pageItems = items.slice(offset, offset + limit);
+  const lastItem = pageItems.at(-1) as
+    | { lastActivityAt?: string; createdAt?: string; lastMessageAt?: string }
+    | undefined;
   return {
     items: pageItems,
     limit,
     offset,
-    hasMore: offset + limit < items.length
+    hasMore: offset + limit < items.length,
+    nextCursor:
+      lastItem?.lastActivityAt ?? lastItem?.createdAt ?? lastItem?.lastMessageAt ?? null
   };
 }
 
-async function collectCandidates(
+async function collectCandidatesImpl(
   db: SupabaseClient,
   userId: string | null,
   filter: string,
   opts: {
     authorIds?: string[] | null;
     authorId?: string | null;
+    includeDiscovery?: boolean;
     scopeKind?: 'channel' | 'community' | null;
     scopeId?: string | null;
     includePrivateEvents?: boolean;
     includeCommentActivity?: boolean;
+    before?: string | null;
     lat?: number | null;
     lon?: number | null;
     radiusKm?: number | null;
@@ -786,50 +798,37 @@ async function collectCandidates(
 ) {
   const fetchLimit = Math.min(Math.max(opts.fetchLimit ?? 80, 20), 80);
   const items: Array<{ sortAt: string; item: unknown }> = [];
+  const { data: candidateRows, error: candidateError } = await db.rpc('get_feed_candidates', {
+    p_user_id: userId,
+    p_filter: filter,
+    p_author_id: opts.authorId ?? null,
+    p_author_ids: opts.authorIds ?? null,
+    p_include_discovery: opts.includeDiscovery ?? false,
+    p_scope_kind: opts.scopeKind ?? null,
+    p_scope_id: opts.scopeId ?? null,
+    p_include_private_events: opts.includePrivateEvents ?? false,
+    p_include_comment_activity: opts.includeCommentActivity ?? false,
+    p_before: opts.before ?? null,
+    p_limit: Math.min(fetchLimit * 5, 400)
+  });
+  if (candidateError) throw candidateError;
 
-  const scopedEntityIds = async (entityType: string): Promise<Set<string> | null> => {
-    if (!opts.scopeKind || !opts.scopeId) return null;
-    const meta =
-      entityType === 'thread'
-        ? { table: 'thread_tags', idCol: 'thread_id' }
-        : entityType === 'project'
-          ? { table: 'project_tags', idCol: 'project_id' }
-          : entityType === 'event'
-            ? { table: 'event_tags', idCol: 'event_id' }
-            : entityType === 'help_request'
-              ? { table: 'help_request_tags', idCol: 'help_request_id' }
-              : null;
-    if (!meta) return new Set();
-    const col = opts.scopeKind === 'channel' ? 'channel_id' : 'community_id';
-    const { data, error } = await db.from(meta.table).select(meta.idCol).eq(col, opts.scopeId);
-    if (error) {
-      console.error('scopedEntityIds error', entityType, error);
-      return new Set();
-    }
-    return new Set((data ?? []).map((row) => String((row as Record<string, unknown>)[meta.idCol])));
-  };
-
-  const [threadScopeIds, projectScopeIds, eventScopeIds, helpScopeIds] = await Promise.all([
-    scopedEntityIds('thread'),
-    scopedEntityIds('project'),
-    scopedEntityIds('event'),
-    scopedEntityIds('help_request')
-  ]);
-
-  const inScope = (entityType: string, entityId: string) => {
-    const set =
-      entityType === 'thread'
-        ? threadScopeIds
-        : entityType === 'project'
-          ? projectScopeIds
-          : entityType === 'event'
-            ? eventScopeIds
-            : entityType === 'help_request'
-              ? helpScopeIds
-              : null;
-    if (!set) return true;
-    return set.has(String(entityId));
-  };
+  const typedCandidateRows = (candidateRows ?? []) as Array<{
+    entity_type: string;
+    entity_id: string;
+  }>;
+  const candidateIds = (entityType: string) =>
+    new Set(
+      typedCandidateRows
+        .filter((row) => row.entity_type === entityType)
+        .map((row) => String(row.entity_id))
+    );
+  const threadScopeIds = candidateIds('thread');
+  const projectScopeIds = candidateIds('project');
+  const eventScopeIds = candidateIds('event');
+  const helpScopeIds = candidateIds('help_request');
+  const postCandidateIds = candidateIds('post');
+  const commentCandidateIds = candidateIds('comment');
 
   const pushMapped = (
     mapped: Array<{ sortAt: string; item: unknown } | null | undefined>
@@ -852,7 +851,7 @@ async function collectCandidates(
       if (opts.authorIds) q = q.in('author_id', opts.authorIds);
       if (threadScopeIds) q = q.in('id', [...threadScopeIds]);
       const { data } = await q;
-      const scoped = (data ?? []).filter((thread) => inScope('thread', thread.id));
+      const scoped = data ?? [];
       const enrichment = await buildFeedEnrichment(
         db,
         userId,
@@ -862,7 +861,7 @@ async function collectCandidates(
       pushMapped(
         await Promise.all(
           scoped.map(async (thread) => {
-            const mapped = await mapThread(db, userId, thread, enrichment);
+            const mapped = await mapThread(db, userId, thread, enrichment, true);
             return mapped ? { sortAt: mapped.lastActivityAt, item: mapped } : null;
           })
         )
@@ -875,13 +874,15 @@ async function collectCandidates(
   if (
     (filter === 'all' || filter === 'posts') &&
     !opts.scopeKind &&
-    (opts.authorId || (opts.authorIds && opts.authorIds.length > 0))
+    (opts.authorId || (opts.authorIds && opts.authorIds.length > 0)) &&
+    postCandidateIds.size > 0
   ) {
     let q = db
       .from('posts')
       .select(
         'id, body, author_id, audience, vote_count, comment_count, created_at, moderation_state, users!fk_posts_author_id_users(id, username, profile_image_url)'
       )
+      .in('id', [...postCandidateIds])
       .order('created_at', { ascending: false })
       .limit(fetchLimit);
     if (opts.authorId) q = q.eq('author_id', opts.authorId);
@@ -903,7 +904,8 @@ async function collectCandidates(
             userId,
             post,
             opts.authorIds ? 'following' : undefined,
-            enrichment
+            enrichment,
+            true
           );
           return mapped ? { sortAt: mapped.createdAt, item: mapped } : null;
         })
@@ -924,7 +926,7 @@ async function collectCandidates(
       if (opts.authorIds) q = q.in('author_id', opts.authorIds);
       if (projectScopeIds) q = q.in('id', [...projectScopeIds]);
       const { data } = await q;
-      const scopedProjects = (data ?? []).filter((project) => inScope('project', project.id));
+      const scopedProjects = data ?? [];
       const projectIds = scopedProjects.map((project) => String(project.id));
       const [latestUpdates, enrichment] = await Promise.all([
         fetchLatestUpdates(db, projectIds, []),
@@ -938,7 +940,8 @@ async function collectCandidates(
               userId,
               project,
               latestUpdates.get(`project:${project.id}`) ?? null,
-              enrichment
+              enrichment,
+              true
             );
             return mapped ? { sortAt: mapped.lastActivityAt, item: mapped } : null;
           })
@@ -961,7 +964,7 @@ async function collectCandidates(
       if (opts.authorIds) q = q.in('created_by', opts.authorIds);
       if (eventScopeIds) q = q.in('id', [...eventScopeIds]);
       const { data } = await q;
-      const scopedEvents = (data ?? []).filter((event) => inScope('event', event.id));
+      const scopedEvents = data ?? [];
       const eventIds = scopedEvents.map((event) => String(event.id));
       const [latestUpdates, enrichment] = await Promise.all([
         fetchLatestUpdates(db, [], eventIds),
@@ -975,7 +978,8 @@ async function collectCandidates(
               userId,
               event,
               latestUpdates.get(`event:${event.id}`) ?? null,
-              enrichment
+              enrichment,
+              true
             );
             return mapped ? { sortAt: mapped.lastActivityAt, item: mapped } : null;
           })
@@ -997,7 +1001,7 @@ async function collectCandidates(
       if (opts.authorIds) q = q.in('author_id', opts.authorIds);
       if (helpScopeIds) q = q.in('id', [...helpScopeIds]);
       const { data } = await q;
-      const scoped = (data ?? []).filter((request) => inScope('help_request', request.id));
+      const scoped = data ?? [];
       const enrichment = await buildFeedEnrichment(
         db,
         userId,
@@ -1008,7 +1012,7 @@ async function collectCandidates(
       pushMapped(
         await Promise.all(
           scoped.map(async (request) => {
-            const mapped = await mapHelp(db, userId, request, enrichment);
+            const mapped = await mapHelp(db, userId, request, enrichment, true);
             return mapped ? { sortAt: mapped.lastActivityAt, item: mapped } : null;
           })
         )
@@ -1017,26 +1021,62 @@ async function collectCandidates(
   }
 
   // FastAPI parity: personal/user/home-following feeds include comment activity.
-  if (opts.includeCommentActivity && filter === 'all' && (opts.authorId || opts.authorIds?.length)) {
+  if (
+    opts.includeCommentActivity &&
+    filter === 'all' &&
+    (opts.authorId || opts.authorIds?.length) &&
+    commentCandidateIds.size > 0
+  ) {
     let q = db
       .from('comments')
       .select(
         'id, subject_type, subject_id, parent_id, body, author_id, vote_count, created_at, moderation_state, users!fk_comments_author_id_users(id, username, profile_image_url)'
       )
+      .in('id', [...commentCandidateIds])
       .neq('moderation_state', 'removed')
       .order('created_at', { ascending: false })
       .limit(fetchLimit);
     if (opts.authorId) q = q.eq('author_id', opts.authorId);
     if (opts.authorIds) q = q.in('author_id', opts.authorIds);
     const { data } = await q;
+    const comments = data ?? [];
+    const commentIds = comments.map((comment) => String(comment.id));
+    const [contextResult, enrichment] = await Promise.all([
+      db.rpc('get_feed_comment_context', {
+        p_user_id: userId,
+        p_comment_ids: commentIds
+      }),
+      buildFeedEnrichment(db, userId, 'comment', commentIds, {
+        includeTags: false,
+        includeSignals: false
+      })
+    ]);
+    if (contextResult.error) throw contextResult.error;
+    const contextRows = (contextResult.data ?? []) as Array<Record<string, unknown>>;
+    const context = new Map<
+      string,
+      { subjectTitle: string; subjectSlug: string | null; replyCount: number; visible: boolean }
+    >(
+      contextRows.map((row) => [
+        String(row.comment_id),
+        {
+          subjectTitle: String(row.subject_title ?? 'Untitled'),
+          subjectSlug: row.subject_slug ? String(row.subject_slug) : null,
+          replyCount: Number(row.reply_count ?? 0),
+          visible: Boolean(row.visible)
+        }
+      ])
+    );
     pushMapped(
       await Promise.all(
-        (data ?? []).map(async (comment) => {
+        comments.map(async (comment) => {
           const mapped = await mapCommentActivity(
             db,
             userId,
             comment,
-            opts.authorIds ? 'following' : undefined
+            opts.authorIds ? 'following' : undefined,
+            context,
+            enrichment
           );
           return mapped ? { sortAt: mapped.createdAt, item: mapped } : null;
         })
@@ -1046,6 +1086,25 @@ async function collectCandidates(
 
   items.sort((a, b) => String(b.sortAt).localeCompare(String(a.sortAt)));
   return items.map((entry) => entry.item);
+}
+
+async function collectCandidates(
+  db: SupabaseClient,
+  userId: string | null,
+  filter: string,
+  opts: NonNullable<Parameters<typeof collectCandidatesImpl>[3]>
+) {
+  return measureServerSpan(
+    'feed.collect-candidates',
+    () => collectCandidatesImpl(db, userId, filter, opts),
+    {
+      authenticated: Boolean(userId),
+      filter,
+      fetchLimit: opts.fetchLimit ?? 80,
+      following: Boolean(opts.authorIds?.length),
+      scoped: Boolean(opts.scopeId)
+    }
+  );
 }
 
 export async function handleFeedPage(
@@ -1058,12 +1117,15 @@ export async function handleFeedPage(
   const offset = Math.max(Number(params.get('offset') ?? 0), 0);
   const filter = params.get('filter') ?? 'all';
   const sort = params.get('sort') ?? 'recent';
+  const before = params.get('before');
+  const pageOffset = before ? 0 : offset;
 
   if (kind === 'public') {
     const items = await collectCandidates(db, userId, filter, {
+      before,
       fetchLimit: Math.min(80, Math.max(40, limit + offset + 20))
     });
-    const page = pageResult(items, limit, offset);
+    const page = pageResult(items, limit, pageOffset);
     return { ...page, sort, total: items.length };
   }
 
@@ -1080,28 +1142,15 @@ export async function handleFeedPage(
       authorIds.push(userId);
     }
     const candidateLimit = Math.min(80, Math.max(40, limit + offset + 20));
-    // Share one discovery fetch between following+public merge when both passes run.
-    const discoveryPromise = collectCandidates(db, userId, filter, { fetchLimit: candidateLimit });
-    const [following, discovery] = await Promise.all([
-      authorIds?.length
-        ? collectCandidates(db, userId, filter, {
-            authorIds,
-            includeCommentActivity: true,
-            fetchLimit: candidateLimit
-          })
-        : Promise.resolve([] as unknown[]),
-      discoveryPromise
-    ]);
-    const seen = new Set<string>();
-    const merged: unknown[] = [];
-    for (const item of [...following, ...discovery]) {
-      const id = (item as { id?: string }).id;
-      if (!id || seen.has(id)) continue;
-      seen.add(id);
-      merged.push(item);
-    }
-    const page = pageResult(merged, limit, offset);
-    return { ...page, sort, total: merged.length };
+    const items = await collectCandidates(db, userId, filter, {
+      authorIds,
+      includeDiscovery: true,
+      includeCommentActivity: true,
+      before,
+      fetchLimit: candidateLimit
+    });
+    const page = pageResult(items, limit, pageOffset);
+    return { ...page, sort, total: items.length };
   }
 
   if (kind === 'personal') {
@@ -1119,28 +1168,20 @@ export async function handleFeedPage(
       const items = await collectCandidates(db, userId, filter, {
         authorIds,
         includeCommentActivity: true,
+        before,
         fetchLimit: candidateLimit
       });
-      return { ...pageResult(items, limit, offset), sort, total: items.length };
+      return { ...pageResult(items, limit, pageOffset), sort, total: items.length };
     }
-    // popular = followed authors + public discovery (FastAPI parity)
-    const [following, discovery] = await Promise.all([
-      collectCandidates(db, userId, filter, {
-        authorIds,
-        includeCommentActivity: true,
-        fetchLimit: candidateLimit
-      }),
-      collectCandidates(db, userId, filter, { fetchLimit: candidateLimit })
-    ]);
-    const seen = new Set<string>();
-    const merged: unknown[] = [];
-    for (const item of [...following, ...discovery]) {
-      const id = (item as { id?: string }).id;
-      if (!id || seen.has(id)) continue;
-      seen.add(id);
-      merged.push(item);
-    }
-    return { ...pageResult(merged, limit, offset), sort, total: merged.length };
+    // Popular combines followed authors and discovery in the candidate RPC.
+    const items = await collectCandidates(db, userId, filter, {
+      authorIds,
+      includeDiscovery: true,
+      includeCommentActivity: true,
+      before,
+      fetchLimit: candidateLimit
+    });
+    return { ...pageResult(items, limit, pageOffset), sort, total: items.length };
   }
 
   if (kind === 'user') {
@@ -1154,9 +1195,10 @@ export async function handleFeedPage(
     const items = await collectCandidates(db, userId, filter, {
       authorId: profile.id,
       includeCommentActivity: true,
+      before,
       fetchLimit: Math.min(80, Math.max(40, limit + offset + 20))
     });
-    return { ...pageResult(items, limit, offset), sort, total: items.length };
+    return { ...pageResult(items, limit, pageOffset), sort, total: items.length };
   }
 
   if (kind === 'scope') {
@@ -1169,23 +1211,25 @@ export async function handleFeedPage(
       .eq('slug', slug)
       .maybeSingle();
     if (!scope) return pageResult([], limit, offset);
-    if (scopeKind === 'community' && scope.join_policy === 'closed') {
+    const scopeRow = scope as unknown as { id: string; join_policy?: string };
+    if (scopeKind === 'community' && scopeRow.join_policy === 'closed') {
       if (!userId) return pageResult([], limit, offset);
       const { data: membership } = await db
         .from('scope_memberships')
         .select('user_id')
         .eq('scope_kind', 'community')
-        .eq('scope_id', scope.id)
+        .eq('scope_id', scopeRow.id)
         .eq('user_id', userId)
         .maybeSingle();
       if (!membership) return pageResult([], limit, offset);
     }
     const items = await collectCandidates(db, userId, filter, {
       scopeKind,
-      scopeId: scope.id,
-      includePrivateEvents: true
+      scopeId: scopeRow.id,
+      includePrivateEvents: true,
+      before
     });
-    return { ...pageResult(items, limit, offset), sort, total: items.length };
+    return { ...pageResult(items, limit, pageOffset), sort, total: items.length };
   }
 
   if (kind === 'region') {
@@ -1203,7 +1247,8 @@ export async function handleFeedPage(
       lon,
       radiusKm,
       // Region feed is physical-only; private events are excluded by mapper options below.
-      includePrivateEvents: false
+      includePrivateEvents: false,
+      before
     });
     const haversine = (aLat: number, aLon: number, bLat: number, bLon: number) => {
       const toRad = (v: number) => (v * Math.PI) / 180;
@@ -1215,17 +1260,29 @@ export async function handleFeedPage(
         Math.cos(toRad(aLat)) * Math.cos(toRad(bLat)) * Math.sin(dLon / 2) ** 2;
       return 2 * R * Math.asin(Math.sqrt(aa));
     };
+    const locationIds = [
+      ...new Set(
+        items
+          .map((item) => (item as { locationId?: string | null }).locationId)
+          .filter((id): id is string => Boolean(id))
+      )
+    ];
+    const { data: locationRows } = locationIds.length
+      ? await db
+          .from('locations')
+          .select('id, latitude, longitude, is_online')
+          .in('id', locationIds)
+      : { data: [] as Array<Record<string, unknown>> };
+    const locationById = new Map(
+      (locationRows ?? []).map((row) => [String(row.id), row])
+    );
     const withDistance: unknown[] = [];
     for (const item of items) {
       const kindLabel = String((item as { kind?: string }).kind ?? '');
       if (kindLabel === 'thread' || kindLabel === 'post') continue;
       const locationId = (item as { locationId?: string | null }).locationId ?? null;
       if (!locationId) continue;
-      const { data: loc } = await db
-        .from('locations')
-        .select('latitude, longitude, is_online')
-        .eq('id', locationId)
-        .maybeSingle();
+      const loc = locationById.get(locationId);
       if (!loc?.latitude || !loc?.longitude || loc.is_online) continue;
       const distanceKm = haversine(lat, lon, Number(loc.latitude), Number(loc.longitude));
       if (distanceKm > radiusKm) continue;
@@ -1236,7 +1293,7 @@ export async function handleFeedPage(
         Number((a as { distanceKm: number }).distanceKm) -
         Number((b as { distanceKm: number }).distanceKm)
     );
-    return { ...pageResult(withDistance, limit, offset), sort, total: withDistance.length };
+    return { ...pageResult(withDistance, limit, pageOffset), sort, total: withDistance.length };
   }
 
   return pageResult([], limit, offset);
@@ -1267,84 +1324,110 @@ export async function handleMapMarkers(
     return 2 * R * Math.asin(Math.sqrt(aa));
   };
 
-  const pushIfNear = async (
-    entityType: 'event' | 'project' | 'help_request',
-    row: any,
-    title: string,
-    slug: string | null,
-    href: string,
-    locationId: string | null
-  ) => {
-    if (!locationId) return;
-    if (!(await canViewEntity(db, userId, entityType, row.id))) return;
-    const { data: loc } = await db
-      .from('locations')
-      .select('*')
-      .eq('id', locationId)
-      .maybeSingle();
-    if (!loc?.latitude || !loc?.longitude || loc.is_online) return;
-    if (!Number.isFinite(lat) || !Number.isFinite(lon)) return;
-    const distanceKm = haversine(lat, lon, Number(loc.latitude), Number(loc.longitude));
-    if (distanceKm > radiusKm) return;
+  if (!Number.isFinite(lat) || !Number.isFinite(lon)) return markers;
+
+  const { data: candidateData, error: candidateError } = await db.rpc('get_feed_candidates', {
+    p_user_id: userId,
+    p_filter: filter,
+    p_author_id: null,
+    p_author_ids: null,
+    p_include_discovery: false,
+    p_scope_kind: null,
+    p_scope_id: null,
+    p_include_private_events: false,
+    p_include_comment_activity: false,
+    p_before: null,
+    p_limit: 300
+  });
+  if (candidateError) throw candidateError;
+  const candidateRows = (candidateData ?? []) as Array<Record<string, unknown>>;
+  const idsFor = (entityType: string) =>
+    candidateRows
+      .filter((row) => row.entity_type === entityType)
+      .map((row) => String(row.entity_id));
+  const eventIds = idsFor('event');
+  const projectIds = idsFor('project');
+  const helpRequestIds = idsFor('help_request');
+
+  const [{ data: events }, { data: projects }, { data: helpRequests }] = await Promise.all([
+    eventIds.length
+      ? db
+          .from('events')
+          .select('id, slug, title, location_id, scheduled_at, ends_at')
+          .in('id', eventIds)
+          .not('location_id', 'is', null)
+      : Promise.resolve({ data: [] }),
+    projectIds.length
+      ? db
+          .from('projects')
+          .select('id, slug, title, location_id')
+          .in('id', projectIds)
+          .not('location_id', 'is', null)
+      : Promise.resolve({ data: [] }),
+    helpRequestIds.length
+      ? db
+          .from('help_requests')
+          .select('id, title, location_id, needed_at, ends_at')
+          .in('id', helpRequestIds)
+          .not('location_id', 'is', null)
+      : Promise.resolve({ data: [] })
+  ]);
+
+  const rows: Array<Record<string, any>> = [
+    ...(events ?? []).map((row) => ({
+      ...row,
+      entityType: 'event',
+      slug: row.slug,
+      href: `/events/${row.slug}`
+    })),
+    ...(projects ?? []).map((row) => ({
+      ...row,
+      entityType: 'project',
+      slug: row.slug,
+      href: `/projects/${row.slug}`
+    })),
+    ...(helpRequests ?? []).map((row) => ({
+      ...row,
+      entityType: 'help_request',
+      slug: null,
+      href: `/help-requests/${row.id}`
+    }))
+  ];
+  const locationIds = [
+    ...new Set(rows.map((row) => String(row.location_id ?? '')).filter(Boolean))
+  ];
+  const { data: locations } = locationIds.length
+    ? await db
+        .from('locations')
+        .select('id, latitude, longitude, precision, display_label, is_online')
+        .in('id', locationIds)
+    : { data: [] as Array<Record<string, unknown>> };
+  const locationById = new Map((locations ?? []).map((row) => [String(row.id), row]));
+
+  for (const row of rows) {
+    const location = locationById.get(String(row.location_id));
+    if (!location?.latitude || !location?.longitude || location.is_online) continue;
+    const distanceKm = haversine(
+      lat,
+      lon,
+      Number(location.latitude),
+      Number(location.longitude)
+    );
+    if (distanceKm > radiusKm) continue;
     markers.push({
       id: row.id,
-      entityType,
-      slug,
-      title,
-      href,
-      latitude: Number(loc.latitude),
-      longitude: Number(loc.longitude),
-      precision: loc.precision ?? 'approximate',
-      displayLabel: loc.display_label,
+      entityType: row.entityType,
+      slug: row.slug,
+      title: row.title,
+      href: row.href,
+      latitude: Number(location.latitude),
+      longitude: Number(location.longitude),
+      precision: location.precision ?? 'approximate',
+      displayLabel: location.display_label,
       distanceKm,
       scheduledAt: row.scheduled_at ?? row.needed_at ?? null,
       endsAt: row.ends_at ?? null
     });
-  };
-
-  if (filter === 'all' || filter === 'events') {
-    const { data } = await db
-      .from('events')
-      .select('id, slug, title, location_id, scheduled_at, ends_at, is_private')
-      .not('location_id', 'is', null)
-      .limit(100);
-    for (const row of data ?? []) {
-      await pushIfNear('event', row, row.title, row.slug, `/events/${row.slug}`, row.location_id);
-    }
-  }
-  if (filter === 'all' || filter === 'projects') {
-    const { data } = await db
-      .from('projects')
-      .select('id, slug, title, location_id')
-      .not('location_id', 'is', null)
-      .limit(100);
-    for (const row of data ?? []) {
-      await pushIfNear(
-        'project',
-        row,
-        row.title,
-        row.slug,
-        `/projects/${row.slug}`,
-        row.location_id
-      );
-    }
-  }
-  if (filter === 'all' || filter === 'help_requests') {
-    const { data } = await db
-      .from('help_requests')
-      .select('id, title, location_id, needed_at, ends_at')
-      .not('location_id', 'is', null)
-      .limit(100);
-    for (const row of data ?? []) {
-      await pushIfNear(
-        'help_request',
-        row,
-        row.title,
-        null,
-        `/help-requests/${row.id}`,
-        row.location_id
-      );
-    }
   }
 
   markers.sort(

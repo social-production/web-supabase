@@ -676,8 +676,15 @@ export async function hydrateActivities(
     userIdsByRole.set(row.role_id as string, ids);
   }
 
-  const rolesByActivity = new Map<string, typeof roles>();
-  for (const role of roles ?? []) {
+  const typedRoles = (roles ?? []) as Array<{
+    id: string;
+    activity_id: string;
+    label: string;
+    required_count: number;
+    maximum_count: number | null;
+  }>;
+  const rolesByActivity = new Map<string, typeof typedRoles>();
+  for (const role of typedRoles) {
     const list = rolesByActivity.get(role.activity_id as string) ?? [];
     list.push(role);
     rolesByActivity.set(role.activity_id as string, list);
@@ -1274,8 +1281,8 @@ export async function buildProjectLifecycle(
   const revertHistory = await hydrateProjectRevertHistory(db, String(project.id));
   const isSoftware =
     String(project.project_subtype ?? '') === 'software' ||
-    String(winningPlan?.projectSubtype ?? '') === 'software' ||
-    Boolean(winningPlan?.repositoryUrl);
+    String((winningPlan as Record<string, unknown> | null)?.projectSubtype ?? '') === 'software' ||
+    Boolean((winningPlan as Record<string, unknown> | null)?.repositoryUrl);
   const softwareGovernance = isSoftware
     ? await hydrateSoftwareGovernance(db, project, userId, viewerIsMember, population)
     : null;

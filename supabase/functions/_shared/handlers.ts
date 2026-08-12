@@ -15,7 +15,8 @@ import { castReportVote, loadActiveReport, loadActiveReportsByTargetIds, reconci
 import { handleFeedPage as assembleFeedPage, handleMapMarkers, viewerVote as feedViewerVote } from './feeds.ts';
 import { recordMeaningfulAction } from './votes.ts';
 import { buildActivityRail } from './activityRail.ts';
-import { buildLinkedChats, countLinkedChatUnread } from './linkedChats.ts';
+import { buildLinkedChats } from './linkedChats.ts';
+import { measureServerSpan } from './performance.ts';
 
 type VoteDirection = -1 | 0 | 1;
 
@@ -48,40 +49,16 @@ async function loadViewer(db: SupabaseClient, userId: string | null) {
 }
 
 async function unreadCounts(db: SupabaseClient, userId: string | null) {
-  if (!userId) return { notifications: 0, messages: 0 };
-  const [{ count: notifications }, { data: memberships }, linkedUnread] = await Promise.all([
-    db
-      .from('notifications')
-      .select('*', { count: 'exact', head: true })
-      .eq('recipient_id', userId)
-      .eq('is_unread', true),
-    db.from('conversation_members').select('conversation_id, last_read_at').eq('user_id', userId),
-    countLinkedChatUnread(db, userId)
-  ]);
-
-  let messages = 0;
-  const membershipRows = memberships ?? [];
-  if (membershipRows.length) {
-    const unreadPairs = await Promise.all(
-      membershipRows.map(async (row) => {
-        let query = db
-          .from('messages')
-          .select('*', { count: 'exact', head: true })
-          .eq('conversation_id', row.conversation_id)
-          .neq('sender_id', userId);
-        if (row.last_read_at) {
-          query = query.gt('created_at', row.last_read_at);
-        }
-        const { count } = await query;
-        return count ?? 0;
-      })
-    );
-    messages = unreadPairs.reduce((sum, count) => sum + count, 0);
-  }
-
-  messages += linkedUnread;
-
-  return { notifications: notifications ?? 0, messages };
+  return measureServerSpan('bootstrap.unread-counts', async () => {
+    if (!userId) return { notifications: 0, messages: 0 };
+    const { data, error } = await db.rpc('get_unread_totals', { p_user_id: userId });
+    if (error) throw error;
+    const row = data?.[0];
+    return {
+      notifications: Number(row?.notifications ?? 0),
+      messages: Number(row?.messages ?? 0)
+    };
+  }, { authenticated: Boolean(userId) });
 }
 
 export async function handleBootstrap(db: SupabaseClient, userId: string | null) {

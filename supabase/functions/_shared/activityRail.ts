@@ -3,6 +3,7 @@
  * Focused on active governance votes the viewer can cast on membership surfaces.
  */
 import type { SupabaseClient } from 'https://esm.sh/@supabase/supabase-js@2.49.1';
+import { measureServerSpan } from './performance.ts';
 
 type RailItem = {
   id: string;
@@ -69,7 +70,7 @@ function viewerAlreadyVoted(
   return Boolean(rows?.some((row) => row.voter_id === userId));
 }
 
-export async function buildActivityRail(
+async function buildActivityRailImpl(
   db: SupabaseClient,
   userId: string | null
 ): Promise<{ activityRail: RailItem[]; activityRailHistory: RailItem[] }> {
@@ -641,4 +642,15 @@ export async function buildActivityRail(
     activityRail: items.slice(0, 24),
     activityRailHistory: []
   };
+}
+
+export async function buildActivityRail(
+  db: SupabaseClient,
+  userId: string | null
+): Promise<{ activityRail: RailItem[]; activityRailHistory: RailItem[] }> {
+  return measureServerSpan(
+    'activity-rail.build',
+    () => buildActivityRailImpl(db, userId),
+    { authenticated: Boolean(userId) }
+  );
 }

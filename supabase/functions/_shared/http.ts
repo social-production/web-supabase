@@ -1,7 +1,8 @@
 export const corsHeaders: Record<string, string> = {
   'Access-Control-Allow-Origin': '*',
   'Access-Control-Allow-Headers':
-    'authorization, x-client-info, apikey, content-type, x-supabase-auth',
+    'authorization, x-client-info, apikey, content-type, x-supabase-auth, x-request-id',
+  'Access-Control-Expose-Headers': 'x-request-id, server-timing',
   'Access-Control-Allow-Methods': 'GET, POST, PUT, PATCH, DELETE, OPTIONS'
 };
 

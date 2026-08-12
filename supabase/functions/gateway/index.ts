@@ -65,7 +65,10 @@ async function viewerActiveVote(
   return Number(data?.direction ?? 0);
 }
 
-Deno.serve(async (req) => {
+async function handleRequest(
+  req: Request,
+  requestContext: { authenticated: boolean }
+): Promise<Response> {
   if (req.method === 'OPTIONS') {
     return new Response('ok', { headers: corsHeaders });
   }
@@ -81,6 +84,7 @@ Deno.serve(async (req) => {
     const authHeader = req.headers.get('Authorization');
     const db = createServiceClient();
     const userId = await requireUserId(db, authHeader);
+    requestContext.authenticated = Boolean(userId);
 
     const readJson = async () => {
       try {
@@ -361,118 +365,22 @@ Deno.serve(async (req) => {
     // Messages
     if (req.method === 'GET' && path === '/messages/conversations') {
       if (!userId) return error('unauthorized', 401);
-      const viewer = await loadViewer(db, userId);
-      const { data: memberships } = await db
-        .from('conversation_members')
-        .select('conversation_id, last_read_at, conversations(*)')
-        .eq('user_id', userId);
-
-      const membershipRows = (memberships ?? [])
-        .map((membership) => {
-          const conversation = Array.isArray(membership.conversations)
-            ? membership.conversations[0]
-            : membership.conversations;
-          if (!conversation) return null;
-          return {
-            conversation,
-            lastReadAt: membership.last_read_at as string | null
-          };
-        })
-        .filter(Boolean) as Array<{ conversation: any; lastReadAt: string | null }>;
-
-      const conversationIds = membershipRows.map((row) => String(row.conversation.id));
-      const participantsByConversation = new Map<
-        string,
-        Array<{ id: string; username: string; profileImageUrl: string | null }>
-      >();
-      const latestByConversation = new Map<string, { body: string; createdAt: string }>();
-      const unreadByConversation = new Map<string, number>();
-
-      if (conversationIds.length) {
-        const memberPromise = db
-          .from('conversation_members')
-          .select(
-            'conversation_id, user_id, users!fk_conversation_members_user_id_users(id, username, profile_image_url)'
-          )
-          .in('conversation_id', conversationIds);
-
-        // One latest row + one unread COUNT per conversation — never scan full histories.
-        const latestPromises = conversationIds.map((conversationId) =>
-          db
-            .from('messages')
-            .select('conversation_id, encrypted_body, created_at')
-            .eq('conversation_id', conversationId)
-            .order('created_at', { ascending: false })
-            .limit(1)
-            .maybeSingle()
-            .then(({ data }) => data)
-        );
-        const unreadPromises = membershipRows.map(({ conversation, lastReadAt }) => {
-          let query = db
-            .from('messages')
-            .select('*', { count: 'exact', head: true })
-            .eq('conversation_id', conversation.id)
-            .neq('sender_id', userId);
-          if (lastReadAt) {
-            query = query.gt('created_at', lastReadAt);
-          }
-          return query.then(({ count }) => [String(conversation.id), count ?? 0] as const);
-        });
-
-        const [{ data: memberRows }, latestRows, unreadPairs] = await Promise.all([
-          memberPromise,
-          Promise.all(latestPromises),
-          Promise.all(unreadPromises)
-        ]);
-
-        for (const row of memberRows ?? []) {
-          const conversationId = String(row.conversation_id);
-          const user = Array.isArray(row.users) ? row.users[0] : row.users;
-          const list = participantsByConversation.get(conversationId) ?? [];
-          list.push({
-            id: user?.id ?? row.user_id,
-            username: user?.username ?? 'unknown',
-            profileImageUrl: user?.profile_image_url ?? null
-          });
-          participantsByConversation.set(conversationId, list);
-        }
-
-        for (const row of latestRows) {
-          if (!row) continue;
-          latestByConversation.set(String(row.conversation_id), {
-            body: String(row.encrypted_body ?? ''),
-            createdAt: String(row.created_at)
-          });
-        }
-        for (const [conversationId, count] of unreadPairs) {
-          unreadByConversation.set(conversationId, count);
-        }
-      }
-
-      const conversations = membershipRows.map(({ conversation }) => {
-        const conversationId = String(conversation.id);
-        const participants = participantsByConversation.get(conversationId) ?? [];
-        const partner =
-          conversation.kind === 'direct'
-            ? participants.find((participant) => participant.id !== userId) ?? null
-            : null;
-        const title =
-          conversation.kind === 'direct'
-            ? partner?.username ?? 'Direct message'
-            : (conversation.title ?? 'Group chat');
-        const latest = latestByConversation.get(conversationId);
-        return {
-          id: conversationId,
-          kind: conversation.kind,
-          title,
-          participants,
-          preview: latest?.body ?? '',
-          lastMessageAt: conversation.last_message_at ?? conversation.created_at,
-          unreadCount: unreadByConversation.get(conversationId) ?? 0,
-          messages: []
-        };
-      });
-      conversations.sort((a, b) => String(b.lastMessageAt).localeCompare(String(a.lastMessageAt)));
+      const [viewer, inboxResult] = await Promise.all([
+        loadViewer(db, userId),
+        db.rpc('get_conversation_inbox', { p_user_id: userId, p_limit: 100 })
+      ]);
+      if (inboxResult.error) throw inboxResult.error;
+      const conversationRows = (inboxResult.data ?? []) as Array<Record<string, any>>;
+      const conversations = conversationRows.map((row) => ({
+        id: String(row.id),
+        kind: row.kind,
+        title: row.title,
+        participants: Array.isArray(row.participants) ? row.participants : [],
+        preview: row.preview ?? '',
+        lastMessageAt: row.last_message_at ?? row.created_at,
+        unreadCount: Number(row.unread_count ?? 0),
+        messages: []
+      }));
       // Linked chats load via /messages/linked-chats — keep this endpoint lean for first paint.
       return json({
         viewer,
@@ -1043,7 +951,16 @@ Deno.serve(async (req) => {
       if (!userId) return error('unauthorized', 401);
       const body = await readJson();
       try {
-        return json(await mutations.createEvent(db, userId, body, persistBodyTags));
+        return json(
+          await mutations.createEvent(
+            db,
+            userId,
+            body,
+            async (tagDb, tagUserId, entity, entityId, tagBody, options) => {
+              await persistBodyTags(tagDb, tagUserId, entity, entityId, tagBody, options);
+            }
+          )
+        );
       } catch (err) {
         const msg = err instanceof Error ? err.message : String(err);
         if (msg === 'invalid_audience' || msg === 'invalid_governance' || msg === 'public_must_be_collaborative') {
@@ -1189,7 +1106,9 @@ Deno.serve(async (req) => {
           .map((item) => (item.providerPlaceId || item.displayLabel || '').toLowerCase())
           .filter(Boolean)
       );
-      const merged = [...localItems];
+      const merged: Array<
+        (typeof localItems)[number] | (typeof externalItems)[number]
+      > = [...localItems];
       for (const item of externalItems) {
         const key = (item.providerPlaceId || item.displayLabel || '').toLowerCase();
         if (key && seen.has(key)) continue;
@@ -1932,4 +1851,48 @@ Deno.serve(async (req) => {
     }
     return error(message, 500);
   }
+}
+
+Deno.serve(async (req) => {
+  const startedAt = performance.now();
+  const requestId = req.headers.get('x-request-id')?.slice(0, 100) || crypto.randomUUID();
+  const url = new URL(req.url);
+  const route = url.pathname
+    .replace(/^\/functions\/v1\/gateway/, '')
+    .replace(/^\/gateway/, '') || '/';
+  let response: Response;
+  const requestContext = { authenticated: false };
+
+  try {
+    response = await handleRequest(req, requestContext);
+  } catch (err) {
+    console.error(JSON.stringify({
+      event: 'gateway_uncaught_error',
+      requestId,
+      method: req.method,
+      route,
+      error: err instanceof Error ? err.message : 'internal_error'
+    }));
+    response = error('internal_error', 500);
+  }
+
+  const durationMs = Math.round((performance.now() - startedAt) * 10) / 10;
+  const headers = new Headers(response.headers);
+  headers.set('x-request-id', requestId);
+  headers.set('server-timing', `gateway;dur=${durationMs}`);
+  console.log(JSON.stringify({
+    event: 'gateway_request',
+    requestId,
+    method: req.method,
+    route,
+    status: response.status,
+    durationMs,
+    authenticated: requestContext.authenticated
+  }));
+
+  return new Response(response.body, {
+    status: response.status,
+    statusText: response.statusText,
+    headers
+  });
 });
