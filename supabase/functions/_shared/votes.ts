@@ -77,36 +77,62 @@ export async function weeklyActiveCount(db: SupabaseClient): Promise<number> {
 export async function projectPopulation(db: SupabaseClient, projectId: string): Promise<number> {
   const { data: project } = await db
     .from('projects')
-    .select('is_platform_tagged, member_count')
+    .select('is_platform_tagged')
     .eq('id', projectId)
     .maybeSingle();
+  // Platform-tagged: N = platform weekly actives, then requiredVotes(N).
   if (project?.is_platform_tagged) return weeklyActiveCount(db);
-  const { count } = await db
-    .from('project_memberships')
-    .select('*', { count: 'exact', head: true })
-    .eq('project_id', projectId);
-  return Math.max(count ?? 0, Number(project?.member_count ?? 0), await weeklyActiveProjectMembers(db, projectId));
+  // Non-platform: N = weekly unique actives within project membership, then requiredVotes(N).
+  return weeklyActiveProjectMembers(db, projectId);
 }
 
 async function weeklyActiveProjectMembers(db: SupabaseClient, projectId: string): Promise<number> {
   const weekAgo = new Date(Date.now() - 7 * 24 * 3600 * 1000).toISOString();
   const { data: members } = await db.from('project_memberships').select('user_id').eq('project_id', projectId);
-  const memberIds = new Set((members ?? []).map((m) => m.user_id));
+  const memberIds = new Set((members ?? []).map((m) => String(m.user_id)));
   if (memberIds.size === 0) return 0;
   const { data: actions } = await db
     .from('meaningful_actions')
     .select('user_id')
     .gte('occurred_at', weekAgo)
     .in('user_id', [...memberIds]);
-  return new Set((actions ?? []).map((a) => a.user_id)).size;
+  return new Set((actions ?? []).map((a) => String(a.user_id)).filter((id) => memberIds.has(id))).size;
+}
+
+export async function isPlatformEvent(db: SupabaseClient, eventId: string): Promise<boolean> {
+  const { data: platformChannel } = await db
+    .from('channels')
+    .select('id')
+    .eq('slug', 'platform')
+    .maybeSingle();
+  if (!platformChannel?.id) return false;
+  const { data } = await db
+    .from('event_tags')
+    .select('id')
+    .eq('event_id', eventId)
+    .eq('tag_kind', 'channel')
+    .eq('channel_id', platformChannel.id)
+    .limit(1);
+  return (data ?? []).length > 0;
+}
+
+async function weeklyActiveEventMembers(db: SupabaseClient, eventId: string): Promise<number> {
+  const weekAgo = new Date(Date.now() - 7 * 24 * 3600 * 1000).toISOString();
+  const { data: members } = await db.from('event_memberships').select('user_id').eq('event_id', eventId);
+  const memberIds = new Set((members ?? []).map((m) => String(m.user_id)));
+  if (memberIds.size === 0) return 0;
+  const { data: actions } = await db
+    .from('meaningful_actions')
+    .select('user_id')
+    .gte('occurred_at', weekAgo)
+    .in('user_id', [...memberIds]);
+  return new Set((actions ?? []).map((a) => String(a.user_id)).filter((id) => memberIds.has(id))).size;
 }
 
 export async function eventPopulation(db: SupabaseClient, eventId: string): Promise<number> {
-  const { count } = await db
-    .from('event_memberships')
-    .select('*', { count: 'exact', head: true })
-    .eq('event_id', eventId);
-  return Math.max(count ?? 0, 1);
+  // Platform-tagged: N = platform weekly actives. Else N = weekly actives within event membership.
+  if (await isPlatformEvent(db, eventId)) return weeklyActiveCount(db);
+  return weeklyActiveEventMembers(db, eventId);
 }
 
 export async function recordMeaningfulAction(

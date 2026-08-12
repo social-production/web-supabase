@@ -5,13 +5,14 @@
  */
 import type { SupabaseClient } from 'https://esm.sh/@supabase/supabase-js@2.49.1';
 import { eventPhaseCopy, projectPhaseCopy } from './lifecycle_copy.ts';
-import { requiredVotes, summarizeVotes } from './votes.ts';
+import { eventPopulation, isPlatformEvent, projectPopulation, requiredVotes, summarizeVotes } from './votes.ts';
 
 function emptySignalSummary(
   supportCount = 0,
   opposeCount = 0,
   viewerSignal: 'demand' | 'opposition' | null = null,
-  population = 0
+  population = 0,
+  usesPlatformVoteContext = false
 ) {
   const totalCount = supportCount + opposeCount;
   const signalRatioPercent = totalCount > 0 ? Math.round((supportCount / totalCount) * 100) : 0;
@@ -30,8 +31,12 @@ function emptySignalSummary(
     requiredDemandCount,
     demandRequirementMet,
     advancementUnlocked,
-    usesPlatformVoteContext: false,
-    voteContextLabel: population > 0 ? 'members' : 'open',
+    usesPlatformVoteContext,
+    voteContextLabel: usesPlatformVoteContext
+      ? 'weekly active users'
+      : population > 0
+        ? 'weekly active members'
+        : 'open',
     voteContextPopulation: population
   };
 }
@@ -1076,7 +1081,10 @@ export async function buildProjectLifecycle(
     | 'phase-7';
   const currentOrder = PROJECT_PHASES.find((p) => p.id === currentPhaseId)?.order ?? 1;
   const next = PROJECT_PHASES.find((p) => p.order === currentOrder + 1) ?? null;
-  const population = Number(project.member_count ?? 0);
+  const usesPlatformVoteContext = Boolean(project.is_platform_tagged);
+  const population = await projectPopulation(db, String(project.id));
+  const quorumVotesRequired = requiredVotes(Math.max(0, population));
+  const voteContextLabel = usesPlatformVoteContext ? 'weekly active users' : 'weekly active members';
   const signals = await loadSignalState(
     db,
     'project_signals',
@@ -1148,8 +1156,8 @@ export async function buildProjectLifecycle(
     supportsPlanning: true,
     currentPhaseId,
     quorumThresholdPercent: 66,
-    quorumVotesRequired: 0,
-    voteContextLabel: 'members',
+    quorumVotesRequired,
+    voteContextLabel,
     voteContextPopulation: population,
     notes: [],
     phases: PROJECT_PHASES.map((phase) => {
@@ -1213,7 +1221,8 @@ export async function buildProjectLifecycle(
         signals.supportCount,
         signals.opposeCount,
         signals.viewerSignal,
-        population
+        population,
+        usesPlatformVoteContext
       ),
       viewerCanAddValue: viewerIsMember,
       viewerCanVoteOnValues: viewerIsMember
@@ -1258,7 +1267,10 @@ export async function buildEventLifecycle(
   const currentOrder = EVENT_PHASES.find((p) => p.id === currentPhaseId)?.order ?? 1;
   const next = EVENT_PHASES.find((p) => p.order === currentOrder + 1) ?? null;
   const previous = EVENT_PHASES.find((p) => p.order === currentOrder - 1) ?? null;
-  const population = Number(event.member_count ?? 0);
+  const usesPlatformVoteContext = await isPlatformEvent(db, String(event.id));
+  const population = await eventPopulation(db, String(event.id));
+  const quorumVotesRequired = requiredVotes(Math.max(0, population));
+  const voteContextLabel = usesPlatformVoteContext ? 'weekly active users' : 'weekly active members';
   const signals = await loadSignalState(db, 'event_signals', 'event_id', String(event.id), userId);
   const phaseOneValues = await hydrateValueImportance(
     db,
@@ -1302,8 +1314,8 @@ export async function buildEventLifecycle(
   return {
     currentPhaseId,
     quorumThresholdPercent: 66,
-    quorumVotesRequired: 0,
-    voteContextLabel: 'members',
+    quorumVotesRequired,
+    voteContextLabel,
     voteContextPopulation: population,
     phases: EVENT_PHASES.map((phase) => {
       const copy = eventPhaseCopy(phase.id, phase.summary);
@@ -1326,7 +1338,8 @@ export async function buildEventLifecycle(
         signals.supportCount,
         signals.opposeCount,
         signals.viewerSignal,
-        population
+        population,
+        usesPlatformVoteContext
       ),
       viewerCanAddValue: viewerIsMember && currentPhaseId === 'proposal',
       viewerCanVoteOnValues: viewerIsMember && currentPhaseId === 'proposal'

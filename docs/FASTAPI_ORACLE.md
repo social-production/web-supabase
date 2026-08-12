@@ -33,7 +33,7 @@ return min(ceil(0.75 * n), cochran)
 
 **Approval rule everywhere:** `voteCount >= requiredVotes(N)` **and** `approvalRatio >= 0.66`.
 
-**Supabase note:** populations often fall back to membership counts when sparse (documented intentional divergence).
+**Supabase note:** ordinary project/event quorum uses N = weekly actives within membership, then `requiredVotes(N)`. Platform-tagged items use platform weekly actives as N.
 
 ---
 

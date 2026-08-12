@@ -42,7 +42,7 @@ import {
 import { createServiceClient, requireUserId } from '../_shared/supabase.ts';
 import { isEventMember, isProjectMember, loadEntityTags, canViewEntity, canViewPost } from '../_shared/access.ts';
 import { persistBodyTags, extractSlugs, TagError } from '../_shared/tags.ts';
-import { reverseGeocodeExternal, searchPlacesExternal } from '../_shared/geocoding.ts';
+import { reverseGeocodeExternal, searchPlacesExternal, clientIpFromRequest, ipLocationHintExternal } from '../_shared/geocoding.ts';
 import { loadActiveReport, moderationFieldsFromRow } from '../_shared/moderation.ts';
 import { recordMeaningfulAction } from '../_shared/votes.ts';
 
@@ -1081,20 +1081,11 @@ Deno.serve(async (req) => {
       });
     }
     if (req.method === 'GET' && path === '/locations/ip-hint') {
-      const { data } = await db.from('locations').select('*').eq('is_online', false).limit(5);
-      return json({
-        items: (data ?? []).map((row) => ({
-          id: row.id,
-          providerPlaceId: row.provider_place_id,
-          displayLabel: row.display_label,
-          latitude: row.latitude,
-          longitude: row.longitude,
-          region: row.region,
-          country: row.country,
-          precision: row.precision,
-          isOnline: row.is_online
-        }))
-      });
+      const hint = await ipLocationHintExternal(clientIpFromRequest(req));
+      if (!hint) {
+        return error('ip_location_unavailable', 422);
+      }
+      return json({ items: [hint] });
     }
     if (req.method === 'GET' && path === '/locations/reverse') {
       const lat = Number(url.searchParams.get('lat'));

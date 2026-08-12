@@ -120,3 +120,68 @@ export async function reverseGeocodeExternal(
   });
   return items[0] ?? null;
 }
+
+const LOOPBACK_IPS = new Set(['127.0.0.1', '::1', '0.0.0.0', '::', 'localhost']);
+
+/** Best-effort client IP from common proxy / edge headers. */
+export function clientIpFromRequest(req: Request): string | null {
+  const forwarded = req.headers.get('x-forwarded-for') ?? req.headers.get('X-Forwarded-For');
+  if (forwarded) {
+    const first = forwarded.split(',')[0]?.trim();
+    if (first) return first;
+  }
+  for (const header of ['cf-connecting-ip', 'true-client-ip', 'x-real-ip', 'x-client-ip']) {
+    const value = req.headers.get(header)?.trim();
+    if (value) return value;
+  }
+  return null;
+}
+
+/**
+ * Approximate place from the caller's public IP (explicit opt-in only).
+ * Mirrors FastAPI `ip_location_hint` using ip-api.com.
+ */
+export async function ipLocationHintExternal(clientIp: string | null): Promise<GeocodeResult | null> {
+  const ip = (clientIp ?? '').trim();
+  if (!ip || LOOPBACK_IPS.has(ip.toLowerCase())) return null;
+
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), 8000);
+  try {
+    const response = await fetch(
+      `http://ip-api.com/json/${encodeURIComponent(ip)}?fields=status,message,country,regionName,city,lat,lon`,
+      {
+        headers: { Accept: 'application/json' },
+        signal: controller.signal
+      }
+    );
+    if (!response.ok) return null;
+    const payload = (await response.json()) as Record<string, unknown>;
+    if (payload.status !== 'success') return null;
+    const lat = Number(payload.lat);
+    const lon = Number(payload.lon);
+    if (!Number.isFinite(lat) || !Number.isFinite(lon)) return null;
+    const city = String(payload.city ?? '').trim();
+    const region = String(payload.regionName ?? '').trim();
+    const country = String(payload.country ?? '').trim();
+    const labelParts = [city, region, country].filter(Boolean);
+    return {
+      id: null,
+      providerPlaceId: null,
+      displayLabel: (labelParts.length ? labelParts.join(', ') : `${lat.toFixed(2)}, ${lon.toFixed(2)}`).slice(
+        0,
+        240
+      ),
+      latitude: Math.round(lat * 1e6) / 1e6,
+      longitude: Math.round(lon * 1e6) / 1e6,
+      region: region ? region.slice(0, 120) : null,
+      country: country ? country.slice(0, 120) : null,
+      precision: 'approximate',
+      isOnline: false
+    };
+  } catch {
+    return null;
+  } finally {
+    clearTimeout(timer);
+  }
+}

@@ -209,7 +209,15 @@ export async function createEvent(
     });
   }
 
-  await recordMeaningfulAction(db, userId, 'create-event', { event_id: data.id, slug: data.slug });
+  // Creator + invitees count as weekly-active members for quorum N.
+  for (const memberId of memberIds) {
+    await recordMeaningfulAction(
+      db,
+      memberId,
+      memberId === userId ? 'create-event' : 'join-event',
+      { event_id: data.id, slug: data.slug }
+    );
+  }
   return { ok: true, id: data.id, slug: data.slug };
 }
 
@@ -234,6 +242,7 @@ export async function toggleProjectMembership(db: SupabaseClient, userId: string
       .from('projects')
       .update({ member_count: (project.member_count ?? 0) + 1 })
       .eq('id', project.id);
+    await recordMeaningfulAction(db, userId, 'join-project', { project_id: project.id, slug });
   }
   return { ok: true, viewerIsMember: !member };
 }
@@ -263,6 +272,7 @@ export async function toggleEventMembership(db: SupabaseClient, userId: string, 
       .from('events')
       .update({ member_count: (event.member_count ?? 0) + 1 })
       .eq('id', event.id);
+    await recordMeaningfulAction(db, userId, 'join-event', { event_id: event.id, slug });
   }
   return { ok: true, viewerIsMember: !member };
 }
