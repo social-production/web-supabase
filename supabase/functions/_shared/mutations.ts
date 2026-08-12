@@ -11,6 +11,7 @@ import {
 } from './access.ts';
 import { applyProjectClose } from './conversion.ts';
 import { displayStageLabel, nextPhaseIdForProject } from './phases.ts';
+import { recordMeaningfulAction } from './votes.ts';
 
 async function getProjectBySlug(db: SupabaseClient, slug: string) {
   const { data } = await db.from('projects').select('*').eq('slug', slug).maybeSingle();
@@ -208,6 +209,7 @@ export async function createEvent(
     });
   }
 
+  await recordMeaningfulAction(db, userId, 'create-event', { event_id: data.id, slug: data.slug });
   return { ok: true, id: data.id, slug: data.slug };
 }
 
@@ -967,6 +969,7 @@ export async function createChannel(db: SupabaseClient, userId: string, input: R
     user_id: userId,
     role: 'moderator'
   });
+  await recordMeaningfulAction(db, userId, 'create-channel', { channel_id: data.id, slug: data.slug });
   return { ok: true, id: data.id, slug: data.slug };
 }
 
@@ -998,6 +1001,10 @@ export async function createCommunity(
     scope_id: data.id,
     user_id: userId,
     role: 'moderator'
+  });
+  await recordMeaningfulAction(db, userId, 'create-community', {
+    community_id: data.id,
+    slug: data.slug
   });
   return { ok: true, id: data.id, slug: data.slug };
 }

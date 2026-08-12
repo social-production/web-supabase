@@ -3,7 +3,7 @@
  * ported from web-backend/app/services/board.py + platform.py feed bits
  */
 import type { SupabaseClient } from 'https://esm.sh/@supabase/supabase-js@2.49.1';
-import { MIN_APPROVAL_RATIO, normalizeYesNo, requiredVotes, weeklyActiveCount } from './votes.ts';
+import { MIN_APPROVAL_RATIO, normalizeYesNo, recordMeaningfulAction, requiredVotes, weeklyActiveCount } from './votes.ts';
 import { handleFeedPage } from './feeds.ts';
 
 const BOARD_STATE_MEMBER = 'member';
@@ -63,8 +63,10 @@ function computeStandingState(input: {
   return 'below-threshold';
 }
 
-async function reconcileBoard(db: SupabaseClient): Promise<{ quorum: number }> {
-  const quorum = requiredVotes(await weeklyActiveCount(db));
+async function reconcileBoard(db: SupabaseClient): Promise<{ quorum: number; weeklyActiveUsers: number }> {
+  // Board standing must stay usable on early betas with sparse meaningful_actions rows.
+  const weeklyActiveUsers = Math.max(await weeklyActiveCount(db), 1);
+  const quorum = requiredVotes(weeklyActiveUsers);
   const { data: memberships } = await db.from('platform_board_memberships').select('*');
   const ids = (memberships ?? []).map((m) => m.user_id);
   const statsMap = await voteStatsMap(db, ids);
@@ -119,7 +121,7 @@ async function reconcileBoard(db: SupabaseClient): Promise<{ quorum: number }> {
     await db.from('platform_board_memberships').delete().eq('user_id', row.user_id);
   }
 
-  return { quorum };
+  return { quorum, weeklyActiveUsers };
 }
 
 export async function volunteerForBoard(db: SupabaseClient, userId: string) {
@@ -130,6 +132,7 @@ export async function volunteerForBoard(db: SupabaseClient, userId: string) {
     grace_ends_at: null,
     updated_at: new Date().toISOString()
   });
+  await recordMeaningfulAction(db, userId, 'volunteer-board', { standing_state: BOARD_STATE_CANDIDATE });
   await reconcileBoard(db);
   return { ok: true };
 }
@@ -163,6 +166,10 @@ export async function castBoardModeratorVote(
       },
       { onConflict: 'target_user_id,voter_id' }
     );
+    await recordMeaningfulAction(db, voterId, 'board-standing-vote', {
+      target_user_id: targetUserId,
+      vote: direction
+    });
   }
   await reconcileBoard(db);
   return { ok: true };
@@ -180,7 +187,7 @@ async function resolvePlatformChannel(db: SupabaseClient) {
 }
 
 export async function getPlatformBoard(db: SupabaseClient, viewerId: string | null) {
-  const { quorum } = await reconcileBoard(db);
+  const { quorum, weeklyActiveUsers } = await reconcileBoard(db);
   const platformChannel = await resolvePlatformChannel(db);
   const { data: memberships } = await db.from('platform_board_memberships').select('*');
   const ids = (memberships ?? []).map((m) => m.user_id);
@@ -211,24 +218,28 @@ export async function getPlatformBoard(db: SupabaseClient, viewerId: string | nu
       quorum,
       graceEndsAt: row.grace_ends_at
     });
+    const viewerVote =
+      viewerVoteMap.get(row.user_id) === 1
+        ? 'yes'
+        : viewerVoteMap.get(row.user_id) === -1
+          ? 'no'
+          : null;
+    // Frontend ScopeMemberSummary expects confidence* fields (FastAPI mapper parity).
     const mapped = {
       id: row.user_id,
       username: user?.username ?? 'unknown',
-      profileImageUrl: user?.profile_image_url ?? null,
-      bio: user?.bio ?? '',
-      standingState,
-      yesCount: stats.yesCount,
-      noCount: stats.noCount,
-      voteCount: stats.voteCount,
-      approvalRatio: stats.approvalRatio,
-      requiredQuorum: quorum,
-      graceEndsAt: row.grace_ends_at,
-      viewerVote:
-        viewerVoteMap.get(row.user_id) === 1
-          ? 'yes'
-          : viewerVoteMap.get(row.user_id) === -1
-            ? 'no'
-            : null
+      bio: (user?.bio as string | undefined) ?? '',
+      confidenceTargetId: row.user_id,
+      confidenceUpVotes: stats.yesCount,
+      confidenceDownVotes: stats.noCount,
+      confidenceVoteCount: stats.voteCount,
+      confidenceReviewCount: stats.voteCount,
+      confidenceRatio: stats.approvalRatio,
+      confidenceStandingState: standingState,
+      confidenceVotesRequired: quorum,
+      confidenceWeeklyActiveUserCount: weeklyActiveUsers,
+      confidenceGraceEndsAt: row.grace_ends_at,
+      confidenceActiveVote: viewerVote === 'yes' ? 1 : viewerVote === 'no' ? -1 : 0
     };
     if (row.standing_state === BOARD_STATE_MEMBER) moderators.push(mapped);
     else moderatorCandidates.push(mapped);
@@ -305,6 +316,7 @@ export async function getPlatformBoard(db: SupabaseClient, viewerId: string | nu
           canVolunteer: viewerBoardState == null
         }
       : null,
-    requiredQuorum: quorum
+    requiredQuorum: quorum,
+    weeklyActiveUsers
   };
 }

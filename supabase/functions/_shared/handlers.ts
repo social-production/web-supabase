@@ -13,6 +13,7 @@ import {
 } from './access.ts';
 import { castReportVote, loadActiveReport, loadActiveReportsByTargetIds, reconcileReport } from './moderation.ts';
 import { handleFeedPage as assembleFeedPage, handleMapMarkers, viewerVote as feedViewerVote } from './feeds.ts';
+import { recordMeaningfulAction } from './votes.ts';
 
 type VoteDirection = -1 | 0 | 1;
 
@@ -266,6 +267,14 @@ export async function handleSetVote(
     await db.from(table).update({ vote_count: voteCount }).eq('id', targetId);
   }
 
+  if (direction !== 0) {
+    await recordMeaningfulAction(db, userId, 'content-vote', {
+      target_type: targetType,
+      target_id: targetId,
+      direction
+    });
+  }
+
   return { ok: true, voteCount, activeVote: direction };
 }
 
@@ -387,6 +396,12 @@ export async function handleAddComment(
         .eq('id', body.subject_id);
     }
   }
+
+  await recordMeaningfulAction(db, userId, 'add-comment', {
+    subject_type: body.subject_type,
+    subject_id: body.subject_id,
+    comment_id: data.id
+  });
 
   return { ok: true, id: data.id };
 }

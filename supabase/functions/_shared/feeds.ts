@@ -455,7 +455,13 @@ async function collectCandidates(
     }
   }
 
-  if (filter === 'all' || filter === 'posts') {
+  // Posts belong on personal/user timelines only. Including them in public/scope
+  // discovery feeds crashes PublicFeedCard (posts lack channelTags and fall through to EventCard).
+  if (
+    (filter === 'all' || filter === 'posts') &&
+    !opts.scopeKind &&
+    (opts.authorId || (opts.authorIds && opts.authorIds.length > 0))
+  ) {
     let q = db
       .from('posts')
       .select(

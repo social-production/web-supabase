@@ -44,6 +44,7 @@ import { isEventMember, isProjectMember, loadEntityTags, canViewEntity, canViewP
 import { persistBodyTags, extractSlugs, TagError } from '../_shared/tags.ts';
 import { reverseGeocodeExternal, searchPlacesExternal } from '../_shared/geocoding.ts';
 import { loadActiveReport, moderationFieldsFromRow } from '../_shared/moderation.ts';
+import { recordMeaningfulAction } from '../_shared/votes.ts';
 
 // Re-export viewer vote helper via a light local call using service client after handlers load.
 async function viewerActiveVote(
@@ -577,6 +578,10 @@ Deno.serve(async (req) => {
         .single();
       if (insertError) throw insertError;
       await persistBodyTags(db, userId, 'thread', data.id, body, { requireAny: true });
+      await recordMeaningfulAction(db, userId, 'create-thread', {
+        thread_id: data.id,
+        slug: data.slug
+      });
       return json({ ok: true, id: data.id, slug: data.slug });
     }
     if (req.method === 'POST' && path === '/content/posts') {
@@ -592,6 +597,7 @@ Deno.serve(async (req) => {
         .select('id')
         .single();
       if (insertError) throw insertError;
+      await recordMeaningfulAction(db, userId, 'create-post', { post_id: data.id });
       return json({ ok: true, id: data.id });
     }
 
@@ -716,6 +722,10 @@ Deno.serve(async (req) => {
         joined_at: new Date().toISOString()
       });
       await db.from('projects').update({ member_count: 1 }).eq('id', data.id);
+      await recordMeaningfulAction(db, userId, 'create-project', {
+        project_id: data.id,
+        slug: data.slug
+      });
       return json({ ok: true, id: data.id, slug: data.slug });
     }
 
@@ -962,6 +972,7 @@ Deno.serve(async (req) => {
         if (rolesError) throw rolesError;
       }
 
+      await recordMeaningfulAction(db, userId, 'create-help-request', { help_request_id: data.id });
       return json({ ok: true, id: data.id });
     }
 
