@@ -385,25 +385,44 @@ Deno.serve(async (req) => {
         string,
         Array<{ id: string; username: string; profileImageUrl: string | null }>
       >();
-      const latestByConversation = new Map<
-        string,
-        { body: string; createdAt: string; senderId: string }
-      >();
+      const latestByConversation = new Map<string, { body: string; createdAt: string }>();
       const unreadByConversation = new Map<string, number>();
 
       if (conversationIds.length) {
-        const [{ data: memberRows }, { data: messageRows }] = await Promise.all([
-          db
-            .from('conversation_members')
-            .select(
-              'conversation_id, user_id, users!fk_conversation_members_user_id_users(id, username, profile_image_url)'
-            )
-            .in('conversation_id', conversationIds),
+        const memberPromise = db
+          .from('conversation_members')
+          .select(
+            'conversation_id, user_id, users!fk_conversation_members_user_id_users(id, username, profile_image_url)'
+          )
+          .in('conversation_id', conversationIds);
+
+        // One latest row + one unread COUNT per conversation — never scan full histories.
+        const latestPromises = conversationIds.map((conversationId) =>
           db
             .from('messages')
-            .select('id, conversation_id, sender_id, encrypted_body, created_at')
-            .in('conversation_id', conversationIds)
+            .select('conversation_id, encrypted_body, created_at')
+            .eq('conversation_id', conversationId)
             .order('created_at', { ascending: false })
+            .limit(1)
+            .maybeSingle()
+            .then(({ data }) => data)
+        );
+        const unreadPromises = membershipRows.map(({ conversation, lastReadAt }) => {
+          let query = db
+            .from('messages')
+            .select('*', { count: 'exact', head: true })
+            .eq('conversation_id', conversation.id)
+            .neq('sender_id', userId);
+          if (lastReadAt) {
+            query = query.gt('created_at', lastReadAt);
+          }
+          return query.then(({ count }) => [String(conversation.id), count ?? 0] as const);
+        });
+
+        const [{ data: memberRows }, latestRows, unreadPairs] = await Promise.all([
+          memberPromise,
+          Promise.all(latestPromises),
+          Promise.all(unreadPromises)
         ]);
 
         for (const row of memberRows ?? []) {
@@ -418,27 +437,15 @@ Deno.serve(async (req) => {
           participantsByConversation.set(conversationId, list);
         }
 
-        const lastReadByConversation = new Map(
-          membershipRows.map((row) => [String(row.conversation.id), row.lastReadAt])
-        );
-        for (const id of conversationIds) unreadByConversation.set(id, 0);
-
-        for (const row of messageRows ?? []) {
-          const conversationId = String(row.conversation_id);
-          if (!latestByConversation.has(conversationId)) {
-            latestByConversation.set(conversationId, {
-              body: String(row.encrypted_body ?? ''),
-              createdAt: String(row.created_at),
-              senderId: String(row.sender_id)
-            });
-          }
-          if (String(row.sender_id) === userId) continue;
-          const lastRead = lastReadByConversation.get(conversationId);
-          if (lastRead && String(row.created_at) <= lastRead) continue;
-          unreadByConversation.set(
-            conversationId,
-            (unreadByConversation.get(conversationId) ?? 0) + 1
-          );
+        for (const row of latestRows) {
+          if (!row) continue;
+          latestByConversation.set(String(row.conversation_id), {
+            body: String(row.encrypted_body ?? ''),
+            createdAt: String(row.created_at)
+          });
+        }
+        for (const [conversationId, count] of unreadPairs) {
+          unreadByConversation.set(conversationId, count);
         }
       }
 

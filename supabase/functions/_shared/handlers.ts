@@ -62,21 +62,21 @@ async function unreadCounts(db: SupabaseClient, userId: string | null) {
   let messages = 0;
   const membershipRows = memberships ?? [];
   if (membershipRows.length) {
-    const conversationIds = membershipRows.map((row) => String(row.conversation_id));
-    const readByConversation = new Map(
-      membershipRows.map((row) => [String(row.conversation_id), row.last_read_at as string | null])
+    const unreadPairs = await Promise.all(
+      membershipRows.map(async (row) => {
+        let query = db
+          .from('messages')
+          .select('*', { count: 'exact', head: true })
+          .eq('conversation_id', row.conversation_id)
+          .neq('sender_id', userId);
+        if (row.last_read_at) {
+          query = query.gt('created_at', row.last_read_at);
+        }
+        const { count } = await query;
+        return count ?? 0;
+      })
     );
-    const { data: unreadRows } = await db
-      .from('messages')
-      .select('conversation_id, created_at')
-      .in('conversation_id', conversationIds)
-      .neq('sender_id', userId);
-    for (const row of unreadRows ?? []) {
-      const conversationId = String(row.conversation_id);
-      const lastRead = readByConversation.get(conversationId);
-      if (lastRead && String(row.created_at) <= String(lastRead)) continue;
-      messages += 1;
-    }
+    messages = unreadPairs.reduce((sum, count) => sum + count, 0);
   }
 
   messages += linkedUnread;
