@@ -56,11 +56,22 @@ export function canStillPass(stats: VoteStats, population: number): boolean {
 
 export async function weeklyActiveCount(db: SupabaseClient): Promise<number> {
   const weekAgo = new Date(Date.now() - 7 * 24 * 3600 * 1000).toISOString();
-  const { data } = await db
-    .from('meaningful_actions')
-    .select('user_id')
-    .gte('occurred_at', weekAgo);
-  return new Set((data ?? []).map((row) => row.user_id).filter(Boolean)).size;
+  const [{ data: actions }, { data: votes }, { data: comments }] = await Promise.all([
+    db.from('meaningful_actions').select('user_id').gte('occurred_at', weekAgo),
+    db.from('content_votes').select('voter_id').gte('updated_at', weekAgo),
+    db.from('comments').select('author_id').gte('created_at', weekAgo)
+  ]);
+  const ids = new Set<string>();
+  for (const row of actions ?? []) {
+    if (row.user_id) ids.add(String(row.user_id));
+  }
+  for (const row of votes ?? []) {
+    if (row.voter_id) ids.add(String(row.voter_id));
+  }
+  for (const row of comments ?? []) {
+    if (row.author_id) ids.add(String(row.author_id));
+  }
+  return ids.size;
 }
 
 export async function projectPopulation(db: SupabaseClient, projectId: string): Promise<number> {

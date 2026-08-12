@@ -151,6 +151,7 @@ export async function castBoardModeratorVote(
   if (!targetUserId) throw new Error('not_found');
   if (targetUserId === voterId) throw new Error('cannot_vote_self');
   const direction = normalizeYesNo(vote);
+  const now = new Date().toISOString();
   if (direction === 0) {
     await db
       .from('board_standing_votes')
@@ -158,14 +159,16 @@ export async function castBoardModeratorVote(
       .eq('target_user_id', targetUserId)
       .eq('voter_id', voterId);
   } else {
-    await db.from('board_standing_votes').upsert(
+    const { error } = await db.from('board_standing_votes').upsert(
       {
         target_user_id: targetUserId,
         voter_id: voterId,
-        vote: direction
+        vote: direction,
+        updated_at: now
       },
       { onConflict: 'target_user_id,voter_id' }
     );
+    if (error) throw error;
     await recordMeaningfulAction(db, voterId, 'board-standing-vote', {
       target_user_id: targetUserId,
       vote: direction

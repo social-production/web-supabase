@@ -381,20 +381,37 @@ Deno.serve(async (req) => {
           };
         });
         const participantById = new Map(participants.map((p) => [p.id, p]));
+        const partner =
+          conversation.kind === 'direct'
+            ? participants.find((p) => p.id !== userId) ?? null
+            : null;
+        const title =
+          conversation.kind === 'direct'
+            ? partner?.username ?? 'Direct message'
+            : (conversation.title ?? 'Group chat');
         const { data: msgs } = await db
           .from('messages')
           .select('id, sender_id, encrypted_body, created_at, moderation_state')
           .eq('conversation_id', conversation.id)
           .order('created_at', { ascending: true })
           .limit(100);
+        let unreadQuery = db
+          .from('messages')
+          .select('*', { count: 'exact', head: true })
+          .eq('conversation_id', conversation.id)
+          .neq('sender_id', userId);
+        if (membership.last_read_at) {
+          unreadQuery = unreadQuery.gt('created_at', membership.last_read_at);
+        }
+        const { count: unreadCount } = await unreadQuery;
         conversations.push({
           id: conversation.id,
           kind: conversation.kind,
-          title: conversation.title ?? '',
+          title,
           participants,
           preview: msgs?.at(-1)?.encrypted_body ?? '',
           lastMessageAt: conversation.last_message_at ?? conversation.created_at,
-          unreadCount: 0,
+          unreadCount: unreadCount ?? 0,
           messages: (msgs ?? []).map((m) => {
             const sender = participantById.get(m.sender_id) ?? {
               id: m.sender_id,
@@ -412,6 +429,7 @@ Deno.serve(async (req) => {
           })
         });
       }
+      conversations.sort((a, b) => String(b.lastMessageAt).localeCompare(String(a.lastMessageAt)));
       return json({
         viewer,
         conversations,
@@ -445,7 +463,12 @@ Deno.serve(async (req) => {
       if (convErr) throw convErr;
       const joinedAt = new Date().toISOString();
       const { error: memberErr } = await db.from('conversation_members').insert([
-        { conversation_id: conversation.id, user_id: userId, joined_at: joinedAt },
+        {
+          conversation_id: conversation.id,
+          user_id: userId,
+          joined_at: joinedAt,
+          last_read_at: joinedAt
+        },
         { conversation_id: conversation.id, user_id: other.id, joined_at: joinedAt }
       ]);
       if (memberErr) throw memberErr;
@@ -457,6 +480,10 @@ Deno.serve(async (req) => {
           encryption_version: 0
         });
         if (msgErr) throw msgErr;
+        await db
+          .from('conversations')
+          .update({ last_message_at: new Date().toISOString() })
+          .eq('id', conversation.id);
       }
       return json({ ok: true, conversationId: conversation.id });
     }
@@ -464,16 +491,23 @@ Deno.serve(async (req) => {
       if (!userId) return error('unauthorized', 401);
       const conversationId = path.split('/')[3];
       const body = await readJson();
+      const sentAt = new Date().toISOString();
       await db.from('messages').insert({
         conversation_id: conversationId,
         sender_id: userId,
         encrypted_body: body.body,
-        encryption_version: 0
+        encryption_version: 0,
+        created_at: sentAt
       });
       await db
         .from('conversations')
-        .update({ last_message_at: new Date().toISOString() })
+        .update({ last_message_at: sentAt })
         .eq('id', conversationId);
+      await db
+        .from('conversation_members')
+        .update({ last_read_at: sentAt })
+        .eq('conversation_id', conversationId)
+        .eq('user_id', userId);
       return json({ ok: true });
     }
     if (req.method === 'POST' && path.match(/^\/messages\/conversations\/[^/]+\/read$/)) {

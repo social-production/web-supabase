@@ -61,7 +61,8 @@ async function unreadCounts(db: SupabaseClient, userId: string | null) {
     let query = db
       .from('messages')
       .select('*', { count: 'exact', head: true })
-      .eq('conversation_id', membership.conversation_id);
+      .eq('conversation_id', membership.conversation_id)
+      .neq('sender_id', userId);
     if (membership.last_read_at) {
       query = query.gt('created_at', membership.last_read_at);
     }
