@@ -494,6 +494,7 @@ export async function voteEventUpdateRequest(
       author_id: request.author_id ?? userId
     });
     await db.from('event_update_requests').update({ status: 'approved' }).eq('id', requestId);
+    await db.from('events').update({ last_activity_at: new Date().toISOString() }).eq('id', event.id);
   } else if (!canStillPass(stats, population)) {
     await db.from('event_update_requests').update({ status: 'rejected' }).eq('id', requestId);
   }
@@ -1336,6 +1337,18 @@ export async function createEventUpdateRequest(
   body: Record<string, unknown>
 ) {
   const event = await getEvent(db, slug);
+  const population = await eventPopulation(db, event.id);
+  // Single-member events auto-apply the update (FastAPI parity).
+  if (population <= 1) {
+    await db.from('event_updates').insert({
+      event_id: event.id,
+      title: 'Update',
+      body: body.body ?? '',
+      author_id: userId
+    });
+    await db.from('events').update({ last_activity_at: new Date().toISOString() }).eq('id', event.id);
+    return { ok: true, autoApproved: true };
+  }
   await db.from('event_update_requests').insert({
     event_id: event.id,
     body: body.body ?? '',

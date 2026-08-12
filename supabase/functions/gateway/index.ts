@@ -25,7 +25,6 @@ import {
   handleUpdateSettings,
   loadViewer
 } from '../_shared/handlers.ts';
-import { mapLinkedChatToFrontend } from '../_shared/linkedChats.ts';
 import * as mutations from '../_shared/mutations.ts';
 import * as lifecycle from '../_shared/lifecycle.ts';
 import * as board from '../_shared/board.ts';
@@ -367,66 +366,111 @@ Deno.serve(async (req) => {
         .from('conversation_members')
         .select('conversation_id, last_read_at, conversations(*)')
         .eq('user_id', userId);
-      const conversations = [];
-      for (const membership of memberships ?? []) {
-        const conversation = Array.isArray(membership.conversations)
-          ? membership.conversations[0]
-          : membership.conversations;
-        if (!conversation) continue;
-        const { data: members } = await db
-          .from('conversation_members')
-          .select('user_id, users!fk_conversation_members_user_id_users(id, username, profile_image_url)')
-          .eq('conversation_id', conversation.id);
-        const participants = (members ?? []).map((m) => {
-          const u = Array.isArray(m.users) ? m.users[0] : m.users;
+
+      const membershipRows = (memberships ?? [])
+        .map((membership) => {
+          const conversation = Array.isArray(membership.conversations)
+            ? membership.conversations[0]
+            : membership.conversations;
+          if (!conversation) return null;
           return {
-            id: u?.id ?? m.user_id,
-            username: u?.username ?? 'unknown',
-            profileImageUrl: u?.profile_image_url ?? null
+            conversation,
+            lastReadAt: membership.last_read_at as string | null
           };
-        });
+        })
+        .filter(Boolean) as Array<{ conversation: any; lastReadAt: string | null }>;
+
+      const conversationIds = membershipRows.map((row) => String(row.conversation.id));
+      const participantsByConversation = new Map<
+        string,
+        Array<{ id: string; username: string; profileImageUrl: string | null }>
+      >();
+      const latestByConversation = new Map<
+        string,
+        { body: string; createdAt: string; senderId: string }
+      >();
+      const unreadByConversation = new Map<string, number>();
+
+      if (conversationIds.length) {
+        const [{ data: memberRows }, { data: messageRows }] = await Promise.all([
+          db
+            .from('conversation_members')
+            .select(
+              'conversation_id, user_id, users!fk_conversation_members_user_id_users(id, username, profile_image_url)'
+            )
+            .in('conversation_id', conversationIds),
+          db
+            .from('messages')
+            .select('id, conversation_id, sender_id, encrypted_body, created_at')
+            .in('conversation_id', conversationIds)
+            .order('created_at', { ascending: false })
+        ]);
+
+        for (const row of memberRows ?? []) {
+          const conversationId = String(row.conversation_id);
+          const user = Array.isArray(row.users) ? row.users[0] : row.users;
+          const list = participantsByConversation.get(conversationId) ?? [];
+          list.push({
+            id: user?.id ?? row.user_id,
+            username: user?.username ?? 'unknown',
+            profileImageUrl: user?.profile_image_url ?? null
+          });
+          participantsByConversation.set(conversationId, list);
+        }
+
+        const lastReadByConversation = new Map(
+          membershipRows.map((row) => [String(row.conversation.id), row.lastReadAt])
+        );
+        for (const id of conversationIds) unreadByConversation.set(id, 0);
+
+        for (const row of messageRows ?? []) {
+          const conversationId = String(row.conversation_id);
+          if (!latestByConversation.has(conversationId)) {
+            latestByConversation.set(conversationId, {
+              body: String(row.encrypted_body ?? ''),
+              createdAt: String(row.created_at),
+              senderId: String(row.sender_id)
+            });
+          }
+          if (String(row.sender_id) === userId) continue;
+          const lastRead = lastReadByConversation.get(conversationId);
+          if (lastRead && String(row.created_at) <= lastRead) continue;
+          unreadByConversation.set(
+            conversationId,
+            (unreadByConversation.get(conversationId) ?? 0) + 1
+          );
+        }
+      }
+
+      const conversations = membershipRows.map(({ conversation }) => {
+        const conversationId = String(conversation.id);
+        const participants = participantsByConversation.get(conversationId) ?? [];
         const partner =
           conversation.kind === 'direct'
-            ? participants.find((p) => p.id !== userId) ?? null
+            ? participants.find((participant) => participant.id !== userId) ?? null
             : null;
         const title =
           conversation.kind === 'direct'
             ? partner?.username ?? 'Direct message'
             : (conversation.title ?? 'Group chat');
-        // List payload: preview only. Full history loads via /messages/conversations/:id/messages.
-        const { data: latestMsgs } = await db
-          .from('messages')
-          .select('id, sender_id, encrypted_body, created_at')
-          .eq('conversation_id', conversation.id)
-          .order('created_at', { ascending: false })
-          .limit(1);
-        const latest = latestMsgs?.[0] ?? null;
-        let unreadQuery = db
-          .from('messages')
-          .select('*', { count: 'exact', head: true })
-          .eq('conversation_id', conversation.id)
-          .neq('sender_id', userId);
-        if (membership.last_read_at) {
-          unreadQuery = unreadQuery.gt('created_at', membership.last_read_at);
-        }
-        const { count: unreadCount } = await unreadQuery;
-        conversations.push({
-          id: conversation.id,
+        const latest = latestByConversation.get(conversationId);
+        return {
+          id: conversationId,
           kind: conversation.kind,
           title,
           participants,
-          preview: latest?.encrypted_body ?? '',
+          preview: latest?.body ?? '',
           lastMessageAt: conversation.last_message_at ?? conversation.created_at,
-          unreadCount: unreadCount ?? 0,
+          unreadCount: unreadByConversation.get(conversationId) ?? 0,
           messages: []
-        });
-      }
+        };
+      });
       conversations.sort((a, b) => String(b.lastMessageAt).localeCompare(String(a.lastMessageAt)));
-      const linked = await handleLinkedChats(db, userId);
+      // Linked chats load via /messages/linked-chats — keep this endpoint lean for first paint.
       return json({
         viewer,
         conversations,
-        linkedChats: linked.items.map(mapLinkedChatToFrontend),
+        linkedChats: [],
         suggestedContacts: [],
         activeConversationId: conversations[0]?.id ?? null
       });
@@ -1364,9 +1408,27 @@ Deno.serve(async (req) => {
           );
         }
         if (action === 'update-requests') {
-          const project = (await db.from('projects').select('id').eq('slug', slug).maybeSingle()).data;
+          const project = (
+            await db.from('projects').select('id, member_count').eq('slug', slug).maybeSingle()
+          ).data;
           if (!project) return error('not_found', 404);
-          await db.from('project_update_requests').insert({ project_id: project.id, body: body.body, author_id: userId });
+          const population = Number(project.member_count ?? 1);
+          if (population <= 1) {
+            await db.from('project_updates').insert({
+              project_id: project.id,
+              title: 'Update',
+              body: body.body ?? '',
+              author_id: userId
+            });
+            await db
+              .from('projects')
+              .update({ last_activity_at: new Date().toISOString() })
+              .eq('id', project.id);
+            return json({ ok: true, autoApproved: true });
+          }
+          await db
+            .from('project_update_requests')
+            .insert({ project_id: project.id, body: body.body, author_id: userId });
           return json({ ok: true });
         }
         if (action === 'edit-requests') {
@@ -1644,6 +1706,23 @@ Deno.serve(async (req) => {
           }
         }
         if (action === 'update-requests') return json(await lifecycle.createEventUpdateRequest(db, userId, slug, body));
+        if (action === 'updates') {
+          try {
+            return json(
+              await mutations.addEventUpdate(
+                db,
+                userId,
+                slug,
+                String(body.title ?? 'Update'),
+                String(body.body ?? '')
+              )
+            );
+          } catch (err) {
+            const msg = err instanceof Error ? err.message : String(err);
+            if (msg === 'not_found') return error('not_found', 404);
+            throw err;
+          }
+        }
         if (action === 'edit-requests') return json(await lifecycle.createEventEditRequest(db, userId, slug, body));
         if (action === 'activities') {
           const event = (await db.from('events').select('id').eq('slug', slug).maybeSingle()).data;

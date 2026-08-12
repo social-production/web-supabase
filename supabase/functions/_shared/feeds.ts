@@ -10,9 +10,37 @@ import {
   loadEntityTags,
   viewerFollowsAuthor
 } from './access.ts';
-import { loadActiveReport, moderationFieldsFromRow } from './moderation.ts';
+import { loadActiveReport, loadActiveReportsByTargetIds, moderationFieldsFromRow } from './moderation.ts';
 
 type VoteDirection = -1 | 0 | 1;
+
+type FeedTagBundle = {
+  channelTags: Array<{ slug: string; label: string; kind: 'channel' }>;
+  communityTags: Array<{ slug: string; label: string; kind: 'community' }>;
+};
+
+type FeedSignalSummary = {
+  supportCount: number;
+  opposeCount: number;
+  viewerSignal: 'demand' | 'opposition' | null;
+  signalCount: number;
+  favorability: number | null;
+};
+
+type FeedEnrichment = {
+  tagsById?: Map<string, FeedTagBundle>;
+  votesById?: Map<string, VoteDirection>;
+  reportsById?: Map<string, Awaited<ReturnType<typeof loadActiveReport>>>;
+  signalsById?: Map<string, FeedSignalSummary>;
+  helpRolesById?: Map<string, Array<{ title: string; description: string; slots: number }>>;
+};
+
+const TAG_TABLE: Record<string, { table: string; idCol: string }> = {
+  thread: { table: 'thread_tags', idCol: 'thread_id' },
+  project: { table: 'project_tags', idCol: 'project_id' },
+  event: { table: 'event_tags', idCol: 'event_id' },
+  help_request: { table: 'help_request_tags', idCol: 'help_request_id' }
+};
 
 function feedAuthorFromUser(
   user: { id?: string | null; username?: string | null; profile_image_url?: string | null } | null | undefined,
@@ -56,13 +84,35 @@ async function viewerVote(
   return (data?.direction ?? 0) as VoteDirection;
 }
 
+async function viewerVotesBatch(
+  db: SupabaseClient,
+  userId: string | null,
+  targetType: string,
+  targetIds: string[]
+) {
+  const out = new Map<string, VoteDirection>();
+  const unique = [...new Set(targetIds.filter(Boolean))];
+  for (const id of unique) out.set(id, 0);
+  if (!userId || unique.length === 0) return out;
+  const { data } = await db
+    .from('content_votes')
+    .select('target_id, direction')
+    .eq('target_type', targetType)
+    .eq('voter_id', userId)
+    .in('target_id', unique);
+  for (const row of data ?? []) {
+    out.set(String(row.target_id), (row.direction ?? 0) as VoteDirection);
+  }
+  return out;
+}
+
 async function signalSummary(
   db: SupabaseClient,
   table: 'project_signals' | 'event_signals',
   idCol: string,
   entityId: string,
   userId: string | null
-) {
+): Promise<FeedSignalSummary> {
   const { data } = await db.from(table).select('signal_type, user_id').eq(idCol, entityId);
   let supportCount = 0;
   let opposeCount = 0;
@@ -82,11 +132,230 @@ async function signalSummary(
   return { supportCount, opposeCount, viewerSignal, signalCount, favorability };
 }
 
-async function mapThread(db: SupabaseClient, userId: string | null, thread: any) {
+async function signalSummariesBatch(
+  db: SupabaseClient,
+  table: 'project_signals' | 'event_signals',
+  idCol: string,
+  entityIds: string[],
+  userId: string | null
+) {
+  const out = new Map<string, FeedSignalSummary>();
+  const unique = [...new Set(entityIds.filter(Boolean))];
+  for (const id of unique) {
+    out.set(id, {
+      supportCount: 0,
+      opposeCount: 0,
+      viewerSignal: null,
+      signalCount: 0,
+      favorability: null
+    });
+  }
+  if (unique.length === 0) return out;
+  const { data } = await db.from(table).select('*').in(idCol, unique);
+  for (const row of (data ?? []) as Array<Record<string, unknown>>) {
+    const id = String(row[idCol] ?? '');
+    const current = out.get(id) ?? {
+      supportCount: 0,
+      opposeCount: 0,
+      viewerSignal: null as 'demand' | 'opposition' | null,
+      signalCount: 0,
+      favorability: null as number | null
+    };
+    const signalType = String(row.signal_type ?? '');
+    if (signalType === 'demand' || signalType === 'support') current.supportCount += 1;
+    if (signalType === 'opposition' || signalType === 'oppose') current.opposeCount += 1;
+    if (userId && String(row.user_id ?? '') === userId) {
+      current.viewerSignal =
+        signalType === 'opposition' || signalType === 'oppose' ? 'opposition' : 'demand';
+    }
+    current.signalCount = current.supportCount + current.opposeCount;
+    current.favorability = current.signalCount > 0 ? current.supportCount / current.signalCount : null;
+    out.set(id, current);
+  }
+  return out;
+}
+
+async function loadEntityTagsBatch(
+  db: SupabaseClient,
+  entityType: string,
+  entityIds: string[]
+) {
+  const out = new Map<string, FeedTagBundle>();
+  const unique = [...new Set(entityIds.filter(Boolean))];
+  for (const id of unique) out.set(id, { channelTags: [], communityTags: [] });
+  const meta = TAG_TABLE[entityType];
+  if (!meta || unique.length === 0) return out;
+
+  const { data: tags } = await db.from(meta.table).select('*').in(meta.idCol, unique);
+
+  const channelIds = new Set<string>();
+  const communityIds = new Set<string>();
+  const rowsByEntity = new Map<string, Array<{ channel_id?: string | null; community_id?: string | null }>>();
+  for (const row of (tags ?? []) as Array<Record<string, unknown>>) {
+    const entityId = String(row[meta.idCol] ?? '');
+    if (!entityId) continue;
+    const list = rowsByEntity.get(entityId) ?? [];
+    list.push({
+      channel_id: (row.channel_id as string | null | undefined) ?? null,
+      community_id: (row.community_id as string | null | undefined) ?? null
+    });
+    rowsByEntity.set(entityId, list);
+    if (row.channel_id) channelIds.add(String(row.channel_id));
+    if (row.community_id) communityIds.add(String(row.community_id));
+  }
+
+  const [{ data: channels }, { data: communities }] = await Promise.all([
+    channelIds.size
+      ? db.from('channels').select('id, slug, name').in('id', [...channelIds])
+      : Promise.resolve({ data: [] as Array<{ id: string; slug: string; name: string }> }),
+    communityIds.size
+      ? db.from('communities').select('id, slug, name').in('id', [...communityIds])
+      : Promise.resolve({ data: [] as Array<{ id: string; slug: string; name: string }> })
+  ]);
+  const channelById = new Map((channels ?? []).map((row) => [String(row.id), row]));
+  const communityById = new Map((communities ?? []).map((row) => [String(row.id), row]));
+
+  for (const [entityId, rows] of rowsByEntity) {
+    const channelTags: FeedTagBundle['channelTags'] = [];
+    const communityTags: FeedTagBundle['communityTags'] = [];
+    for (const row of rows) {
+      if (row.channel_id) {
+        const channel = channelById.get(String(row.channel_id));
+        if (channel) channelTags.push({ slug: channel.slug, label: channel.name, kind: 'channel' });
+      }
+      if (row.community_id) {
+        const community = communityById.get(String(row.community_id));
+        if (community) {
+          communityTags.push({ slug: community.slug, label: community.name, kind: 'community' });
+        }
+      }
+    }
+    out.set(entityId, { channelTags, communityTags });
+  }
+  return out;
+}
+
+async function helpRolesBatch(db: SupabaseClient, helpRequestIds: string[]) {
+  const out = new Map<string, Array<{ title: string; description: string; slots: number }>>();
+  const unique = [...new Set(helpRequestIds.filter(Boolean))];
+  for (const id of unique) out.set(id, []);
+  if (unique.length === 0) return out;
+  const { data } = await db
+    .from('help_request_roles')
+    .select('help_request_id, title, description, slots')
+    .in('help_request_id', unique);
+  for (const row of data ?? []) {
+    const id = String(row.help_request_id);
+    const list = out.get(id) ?? [];
+    list.push({
+      title: row.title,
+      description: row.description ?? '',
+      slots: row.slots
+    });
+    out.set(id, list);
+  }
+  return out;
+}
+
+async function buildFeedEnrichment(
+  db: SupabaseClient,
+  userId: string | null,
+  entityType: 'thread' | 'project' | 'event' | 'help_request' | 'post' | 'comment',
+  entityIds: string[],
+  options: { includeSignals?: boolean; includeTags?: boolean; includeHelpRoles?: boolean } = {}
+): Promise<FeedEnrichment> {
+  const unique = [...new Set(entityIds.filter(Boolean))];
+  if (unique.length === 0) return {};
+
+  const includeTags = options.includeTags ?? (entityType !== 'post' && entityType !== 'comment');
+  const includeSignals = options.includeSignals ?? (entityType === 'project' || entityType === 'event');
+  const includeHelpRoles = options.includeHelpRoles ?? entityType === 'help_request';
+
+  const [tagsById, votesById, reportsById, signalsById, helpRolesById] = await Promise.all([
+    includeTags ? loadEntityTagsBatch(db, entityType, unique) : Promise.resolve(undefined),
+    viewerVotesBatch(db, userId, entityType, unique),
+    loadActiveReportsByTargetIds(db, entityType, unique, userId),
+    includeSignals
+      ? signalSummariesBatch(
+          db,
+          entityType === 'event' ? 'event_signals' : 'project_signals',
+          entityType === 'event' ? 'event_id' : 'project_id',
+          unique,
+          userId
+        )
+      : Promise.resolve(undefined),
+    includeHelpRoles ? helpRolesBatch(db, unique) : Promise.resolve(undefined)
+  ]);
+
+  return {
+    tagsById,
+    votesById,
+    reportsById,
+    signalsById,
+    helpRolesById
+  };
+}
+
+async function resolveTags(
+  db: SupabaseClient,
+  entityType: string,
+  entityId: string,
+  enrichment?: FeedEnrichment
+): Promise<FeedTagBundle> {
+  const cached = enrichment?.tagsById?.get(String(entityId));
+  if (cached) return cached;
+  return loadEntityTags(db, entityType, entityId);
+}
+
+async function resolveVote(
+  db: SupabaseClient,
+  userId: string | null,
+  targetType: string,
+  targetId: string,
+  enrichment?: FeedEnrichment
+): Promise<VoteDirection> {
+  if (enrichment?.votesById?.has(String(targetId))) {
+    return enrichment.votesById.get(String(targetId)) ?? 0;
+  }
+  return viewerVote(db, userId, targetType, targetId);
+}
+
+async function resolveReport(
+  db: SupabaseClient,
+  targetType: string,
+  targetId: string,
+  userId: string | null,
+  enrichment?: FeedEnrichment
+) {
+  if (enrichment?.reportsById) {
+    return enrichment.reportsById.get(String(targetId)) ?? null;
+  }
+  return loadActiveReport(db, targetType, targetId, userId);
+}
+
+async function resolveSignals(
+  db: SupabaseClient,
+  table: 'project_signals' | 'event_signals',
+  idCol: string,
+  entityId: string,
+  userId: string | null,
+  enrichment?: FeedEnrichment
+): Promise<FeedSignalSummary> {
+  const cached = enrichment?.signalsById?.get(String(entityId));
+  if (cached) return cached;
+  return signalSummary(db, table, idCol, entityId, userId);
+}
+
+async function mapThread(
+  db: SupabaseClient,
+  userId: string | null,
+  thread: any,
+  enrichment?: FeedEnrichment
+) {
   if (!(await canViewByTags(db, userId, 'thread', thread.id))) return null;
   const author = Array.isArray(thread.users) ? thread.users[0] : thread.users;
-  const tags = await loadEntityTags(db, 'thread', thread.id);
-  const report = await loadActiveReport(db, 'thread', thread.id, userId);
+  const tags = await resolveTags(db, 'thread', thread.id, enrichment);
+  const report = await resolveReport(db, 'thread', thread.id, userId, enrichment);
   const feedAuthor = feedAuthorFromUser(author, thread.author_id);
   return {
     kind: 'thread',
@@ -100,17 +369,23 @@ async function mapThread(db: SupabaseClient, userId: string | null, thread: any)
     authorUsername: feedAuthor.username,
     ...tags,
     voteCount: thread.vote_count ?? 0,
-    activeVote: await viewerVote(db, userId, 'thread', thread.id),
+    activeVote: await resolveVote(db, userId, 'thread', thread.id, enrichment),
     commentCount: thread.comment_count ?? 0,
     lastActivityAt: thread.last_activity_at ?? thread.created_at,
     ...mapModeration(thread, report)
   };
 }
 
-async function mapPost(db: SupabaseClient, userId: string | null, post: any, feedSource?: string) {
+async function mapPost(
+  db: SupabaseClient,
+  userId: string | null,
+  post: any,
+  feedSource?: string,
+  enrichment?: FeedEnrichment
+) {
   if (!(await canViewPost(db, userId, post))) return null;
   const author = Array.isArray(post.users) ? post.users[0] : post.users;
-  const report = await loadActiveReport(db, 'post', post.id, userId);
+  const report = await resolveReport(db, 'post', post.id, userId, enrichment);
   return {
     kind: 'post',
     id: `post-activity-${post.id}`,
@@ -119,11 +394,12 @@ async function mapPost(db: SupabaseClient, userId: string | null, post: any, fee
     author: feedAuthorFromUser(author, post.author_id),
     body: post.body,
     linkedSubjects: [],
+    feedSource,
+    audience: post.audience === 'followers' ? 'followers' : 'public',
     voteTargetId: post.id,
     voteCount: post.vote_count ?? 0,
-    activeVote: await viewerVote(db, userId, 'post', post.id),
+    activeVote: await resolveVote(db, userId, 'post', post.id, enrichment),
     commentCount: post.comment_count ?? 0,
-    feedSource,
     ...mapModeration(post, report)
   };
 }
@@ -180,13 +456,21 @@ async function mapProject(
   db: SupabaseClient,
   userId: string | null,
   project: any,
-  latestUpdate?: { body: string; createdAt: string } | null
+  latestUpdate?: { body: string; createdAt: string } | null,
+  enrichment?: FeedEnrichment
 ) {
   if (!(await canViewByTags(db, userId, 'project', project.id))) return null;
   const author = Array.isArray(project.users) ? project.users[0] : project.users;
-  const tags = await loadEntityTags(db, 'project', project.id);
-  const signals = await signalSummary(db, 'project_signals', 'project_id', project.id, userId);
-  const report = await loadActiveReport(db, 'project', project.id, userId);
+  const tags = await resolveTags(db, 'project', project.id, enrichment);
+  const signals = await resolveSignals(
+    db,
+    'project_signals',
+    'project_id',
+    project.id,
+    userId,
+    enrichment
+  );
+  const report = await resolveReport(db, 'project', project.id, userId, enrichment);
   const feedAuthor = feedAuthorFromUser(author, project.author_id);
   return {
     kind: 'project',
@@ -205,7 +489,7 @@ async function mapProject(
     locationLabel: project.location_label ?? '',
     locationId: project.location_id ?? null,
     voteCount: project.vote_count ?? 0,
-    activeVote: await viewerVote(db, userId, 'project', project.id),
+    activeVote: await resolveVote(db, userId, 'project', project.id, enrichment),
     signalCount: signals.signalCount,
     supportCount: signals.supportCount,
     opposeCount: signals.opposeCount,
@@ -218,9 +502,13 @@ async function mapProject(
     ...(latestUpdate
       ? {
           latestDescription: latestUpdate.body,
-          latestUpdateAt: latestUpdate.createdAt
+          latestUpdateAt: latestUpdate.createdAt,
+          activityKind:
+            +new Date(latestUpdate.createdAt) > +new Date(project.created_at)
+              ? 'updated'
+              : 'created'
         }
-      : {}),
+      : { activityKind: 'created' as const }),
     ...mapModeration(project, report)
   };
 }
@@ -229,14 +517,22 @@ async function mapEvent(
   db: SupabaseClient,
   userId: string | null,
   event: any,
-  latestUpdate?: { body: string; createdAt: string } | null
+  latestUpdate?: { body: string; createdAt: string } | null,
+  enrichment?: FeedEnrichment
 ) {
   if (!(await canViewPrivateEvent(db, userId, event))) return null;
   if (!event.is_private && !(await canViewByTags(db, userId, 'event', event.id))) return null;
   const author = Array.isArray(event.users) ? event.users[0] : event.users;
-  const tags = await loadEntityTags(db, 'event', event.id);
-  const signals = await signalSummary(db, 'event_signals', 'event_id', event.id, userId);
-  const report = await loadActiveReport(db, 'event', event.id, userId);
+  const tags = await resolveTags(db, 'event', event.id, enrichment);
+  const signals = await resolveSignals(
+    db,
+    'event_signals',
+    'event_id',
+    event.id,
+    userId,
+    enrichment
+  );
+  const report = await resolveReport(db, 'event', event.id, userId, enrichment);
   return {
     kind: 'event',
     id: event.id,
@@ -254,7 +550,7 @@ async function mapEvent(
     locationLabel: event.location_label ?? '',
     locationId: event.location_id ?? null,
     voteCount: event.vote_count ?? 0,
-    activeVote: await viewerVote(db, userId, 'event', event.id),
+    activeVote: await resolveVote(db, userId, 'event', event.id, enrichment),
     signalCount: signals.signalCount,
     supportCount: signals.supportCount,
     opposeCount: signals.opposeCount,
@@ -266,22 +562,40 @@ async function mapEvent(
     ...(latestUpdate
       ? {
           latestUpdateBody: latestUpdate.body,
-          latestUpdateAt: latestUpdate.createdAt
+          latestUpdateAt: latestUpdate.createdAt,
+          activityKind:
+            +new Date(latestUpdate.createdAt) > +new Date(event.created_at)
+              ? 'updated'
+              : 'created'
         }
-      : {}),
+      : { activityKind: 'created' as const }),
     ...mapModeration(event, report)
   };
 }
 
-async function mapHelp(db: SupabaseClient, userId: string | null, request: any) {
+async function mapHelp(
+  db: SupabaseClient,
+  userId: string | null,
+  request: any,
+  enrichment?: FeedEnrichment
+) {
   if (!(await canViewByTags(db, userId, 'help_request', request.id))) return null;
   const author = Array.isArray(request.users) ? request.users[0] : request.users;
-  const tags = await loadEntityTags(db, 'help_request', request.id);
-  const report = await loadActiveReport(db, 'help_request', request.id, userId);
-  const { data: roles } = await db
-    .from('help_request_roles')
-    .select('title, description, slots')
-    .eq('help_request_id', request.id);
+  const tags = await resolveTags(db, 'help_request', request.id, enrichment);
+  const report = await resolveReport(db, 'help_request', request.id, userId, enrichment);
+  const roles =
+    enrichment?.helpRolesById?.get(String(request.id)) ??
+    (
+      await db
+        .from('help_request_roles')
+        .select('title, description, slots')
+        .eq('help_request_id', request.id)
+    ).data?.map((role) => ({
+      title: role.title,
+      description: role.description ?? '',
+      slots: role.slots
+    })) ??
+    [];
   return {
     kind: 'help-request',
     id: request.id,
@@ -295,14 +609,10 @@ async function mapHelp(db: SupabaseClient, userId: string | null, request: any) 
     locationId: request.location_id ?? null,
     scheduleLabel: request.schedule_label ?? '',
     neededAt: request.needed_at,
-    roles: (roles ?? []).map((role) => ({
-      title: role.title,
-      description: role.description ?? '',
-      slots: role.slots
-    })),
+    roles,
     ...tags,
     voteCount: request.vote_count ?? 0,
-    activeVote: await viewerVote(db, userId, 'help_request', request.id),
+    activeVote: await resolveVote(db, userId, 'help_request', request.id, enrichment),
     commentCount: request.comment_count ?? 0,
     lastActivityAt: request.last_activity_at ?? request.created_at,
     ...mapModeration(request, report)
@@ -543,10 +853,16 @@ async function collectCandidates(
       if (threadScopeIds) q = q.in('id', [...threadScopeIds]);
       const { data } = await q;
       const scoped = (data ?? []).filter((thread) => inScope('thread', thread.id));
+      const enrichment = await buildFeedEnrichment(
+        db,
+        userId,
+        'thread',
+        scoped.map((thread) => String(thread.id))
+      );
       pushMapped(
         await Promise.all(
           scoped.map(async (thread) => {
-            const mapped = await mapThread(db, userId, thread);
+            const mapped = await mapThread(db, userId, thread, enrichment);
             return mapped ? { sortAt: mapped.lastActivityAt, item: mapped } : null;
           })
         )
@@ -571,10 +887,24 @@ async function collectCandidates(
     if (opts.authorId) q = q.eq('author_id', opts.authorId);
     if (opts.authorIds) q = q.in('author_id', opts.authorIds);
     const { data } = await q;
+    const posts = data ?? [];
+    const enrichment = await buildFeedEnrichment(
+      db,
+      userId,
+      'post',
+      posts.map((post) => String(post.id)),
+      { includeTags: false, includeSignals: false }
+    );
     pushMapped(
       await Promise.all(
-        (data ?? []).map(async (post) => {
-          const mapped = await mapPost(db, userId, post, opts.authorIds ? 'following' : undefined);
+        posts.map(async (post) => {
+          const mapped = await mapPost(
+            db,
+            userId,
+            post,
+            opts.authorIds ? 'following' : undefined,
+            enrichment
+          );
           return mapped ? { sortAt: mapped.createdAt, item: mapped } : null;
         })
       )
@@ -595,11 +925,11 @@ async function collectCandidates(
       if (projectScopeIds) q = q.in('id', [...projectScopeIds]);
       const { data } = await q;
       const scopedProjects = (data ?? []).filter((project) => inScope('project', project.id));
-      const latestUpdates = await fetchLatestUpdates(
-        db,
-        scopedProjects.map((project) => String(project.id)),
-        []
-      );
+      const projectIds = scopedProjects.map((project) => String(project.id));
+      const [latestUpdates, enrichment] = await Promise.all([
+        fetchLatestUpdates(db, projectIds, []),
+        buildFeedEnrichment(db, userId, 'project', projectIds, { includeSignals: true })
+      ]);
       pushMapped(
         await Promise.all(
           scopedProjects.map(async (project) => {
@@ -607,7 +937,8 @@ async function collectCandidates(
               db,
               userId,
               project,
-              latestUpdates.get(`project:${project.id}`) ?? null
+              latestUpdates.get(`project:${project.id}`) ?? null,
+              enrichment
             );
             return mapped ? { sortAt: mapped.lastActivityAt, item: mapped } : null;
           })
@@ -631,11 +962,11 @@ async function collectCandidates(
       if (eventScopeIds) q = q.in('id', [...eventScopeIds]);
       const { data } = await q;
       const scopedEvents = (data ?? []).filter((event) => inScope('event', event.id));
-      const latestUpdates = await fetchLatestUpdates(
-        db,
-        [],
-        scopedEvents.map((event) => String(event.id))
-      );
+      const eventIds = scopedEvents.map((event) => String(event.id));
+      const [latestUpdates, enrichment] = await Promise.all([
+        fetchLatestUpdates(db, [], eventIds),
+        buildFeedEnrichment(db, userId, 'event', eventIds, { includeSignals: true })
+      ]);
       pushMapped(
         await Promise.all(
           scopedEvents.map(async (event) => {
@@ -643,7 +974,8 @@ async function collectCandidates(
               db,
               userId,
               event,
-              latestUpdates.get(`event:${event.id}`) ?? null
+              latestUpdates.get(`event:${event.id}`) ?? null,
+              enrichment
             );
             return mapped ? { sortAt: mapped.lastActivityAt, item: mapped } : null;
           })
@@ -666,10 +998,17 @@ async function collectCandidates(
       if (helpScopeIds) q = q.in('id', [...helpScopeIds]);
       const { data } = await q;
       const scoped = (data ?? []).filter((request) => inScope('help_request', request.id));
+      const enrichment = await buildFeedEnrichment(
+        db,
+        userId,
+        'help_request',
+        scoped.map((request) => String(request.id)),
+        { includeHelpRoles: true }
+      );
       pushMapped(
         await Promise.all(
           scoped.map(async (request) => {
-            const mapped = await mapHelp(db, userId, request);
+            const mapped = await mapHelp(db, userId, request, enrichment);
             return mapped ? { sortAt: mapped.lastActivityAt, item: mapped } : null;
           })
         )
@@ -741,6 +1080,8 @@ export async function handleFeedPage(
       authorIds.push(userId);
     }
     const candidateLimit = Math.min(80, Math.max(40, limit + offset + 20));
+    // Share one discovery fetch between following+public merge when both passes run.
+    const discoveryPromise = collectCandidates(db, userId, filter, { fetchLimit: candidateLimit });
     const [following, discovery] = await Promise.all([
       authorIds?.length
         ? collectCandidates(db, userId, filter, {
@@ -749,7 +1090,7 @@ export async function handleFeedPage(
             fetchLimit: candidateLimit
           })
         : Promise.resolve([] as unknown[]),
-      collectCandidates(db, userId, filter, { fetchLimit: candidateLimit })
+      discoveryPromise
     ]);
     const seen = new Set<string>();
     const merged: unknown[] = [];

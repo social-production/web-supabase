@@ -520,7 +520,32 @@ export async function updateProjectDetails(
   if (project.author_id !== userId && !(await isProjectMember(db, project.id, userId))) {
     throw new Error('forbidden');
   }
-  await db.from('projects').update({ title, description }).eq('id', project.id);
+  await db
+    .from('projects')
+    .update({ title, description, last_activity_at: new Date().toISOString() })
+    .eq('id', project.id);
+  return { ok: true };
+}
+
+export async function addEventUpdate(
+  db: SupabaseClient,
+  userId: string,
+  slug: string,
+  title: string,
+  body: string
+) {
+  const { data: event } = await db.from('events').select('id').eq('slug', slug).maybeSingle();
+  if (!event) throw new Error('not_found');
+  await db.from('event_updates').insert({
+    event_id: event.id,
+    title,
+    body,
+    author_id: userId
+  });
+  await db
+    .from('events')
+    .update({ last_activity_at: new Date().toISOString() })
+    .eq('id', event.id);
   return { ok: true };
 }
 
