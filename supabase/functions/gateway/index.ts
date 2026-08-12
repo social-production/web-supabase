@@ -691,10 +691,20 @@ Deno.serve(async (req) => {
               createdAt: u.created_at
             };
           }),
-          updateRequests: await hydrateProjectUpdateRequests(db, data.id, userId),
+          updateRequests: await hydrateProjectUpdateRequests(
+            db,
+            data.id,
+            userId,
+            Number(projectLifecycle.voteContextPopulation ?? data.member_count ?? 0)
+          ),
           viewerCanRequestUpdate: Boolean(userId),
           viewerCanVoteOnUpdateRequests: Boolean(userId),
-          editRequests: await hydrateProjectEditRequests(db, data.id, userId),
+          editRequests: await hydrateProjectEditRequests(
+            db,
+            data.id,
+            userId,
+            Number(projectLifecycle.voteContextPopulation ?? data.member_count ?? 0)
+          ),
           viewerCanRequestEdit: Boolean(userId),
           viewerCanVoteOnEditRequests: Boolean(userId),
           linksFrame: await buildLinksFrame(db, 'project', data, viewerIsMember, userId),
@@ -860,10 +870,20 @@ Deno.serve(async (req) => {
             authorUsername: 'unknown',
             createdAt: u.created_at
           })),
-          updateRequests: await hydrateEventUpdateRequests(db, data.id, userId),
+          updateRequests: await hydrateEventUpdateRequests(
+            db,
+            data.id,
+            userId,
+            Number(eventLifecycle.voteContextPopulation ?? data.member_count ?? 0)
+          ),
           viewerCanRequestUpdate: Boolean(userId),
           viewerCanVoteOnUpdateRequests: Boolean(userId),
-          editRequests: await hydrateEventEditRequests(db, data.id, userId),
+          editRequests: await hydrateEventEditRequests(
+            db,
+            data.id,
+            userId,
+            Number(eventLifecycle.voteContextPopulation ?? data.member_count ?? 0)
+          ),
           viewerCanRequestEdit: Boolean(userId),
           viewerCanVoteOnEditRequests: Boolean(userId),
           linksFrame: await buildLinksFrame(db, 'event', data, viewerIsMember, userId),

@@ -242,6 +242,7 @@ function buildPlanVoteSummary(
       else if (mine.vote === 'no' || mine.vote === -1 || mine.vote === '-1') activeVote = 'no';
     }
   }
+  const remainingEligibleVotes = Math.max(0, population - stats.voteCount);
   return {
     yesCount: stats.yesCount,
     noCount: stats.noCount,
@@ -252,7 +253,8 @@ function buildPlanVoteSummary(
     eligibleVoterCount: population,
     quorumThresholdPercent: 66,
     votesRequired,
-    votesRemaining: Math.max(0, votesRequired - stats.voteCount)
+    votesRemaining: Math.max(0, votesRequired - stats.voteCount),
+    remainingEligibleVotes
   };
 }
 
@@ -793,7 +795,7 @@ async function hydrateSoftwareGovernance(
   const { data: prRows } = await db
     .from('project_pull_requests')
     .select(
-      'id, title, summary, pull_request_id, pull_request_url, author_id, stage, merge_id, merge_url, merged_by_user_id, approval_threshold_percent, created_at'
+      'id, decision_id, title, summary, pull_request_id, pull_request_url, author_id, stage, merge_id, merge_url, merged_by_user_id, approval_threshold_percent, created_at'
     )
     .eq('project_id', projectId)
     .order('created_at', { ascending: false });
@@ -816,42 +818,171 @@ async function hydrateSoftwareGovernance(
     }
   }
 
+  const stageLabel = (stage: string) => {
+    switch (stage) {
+      case 'approval':
+        return 'Awaiting approval';
+      case 'awaiting-merge':
+        return 'Awaiting merge';
+      case 'confirmation':
+        return 'Awaiting confirmation';
+      case 'confirmed':
+        return 'Confirmed';
+      case 'rejected':
+        return 'Rejected';
+      case 'replaced':
+        return 'Replaced';
+      default:
+        return stage.replace(/-/g, ' ');
+    }
+  };
+
   const pullRequests = (prRows ?? []).map((row) => {
-    const summary = buildPlanVoteSummary(votesByPr.get(row.id as string) ?? [], userId, population);
+    const built = buildGovernanceVoteSummary(
+      votesByPr.get(row.id as string) ?? [],
+      userId,
+      population
+    );
+    const stage = String(row.stage ?? 'approval');
     return {
       id: row.id,
+      decisionId: row.decision_id ?? null,
       title: row.title,
       summary: row.summary ?? '',
       pullRequestId: row.pull_request_id,
       pullRequestUrl: row.pull_request_url,
       authorUsername: authorById.get(row.author_id as string) ?? 'unknown',
-      stage: row.stage,
+      stage,
+      stageLabel: stageLabel(stage),
       mergeId: row.merge_id ?? null,
       mergeUrl: row.merge_url ?? null,
       mergedByUsername: null,
       approvalThresholdPercent: Number(row.approval_threshold_percent ?? 66),
       createdAt: row.created_at,
-      voteSummary: summary,
-      passesApprovalThreshold: summary.meetsQuorum && summary.approvalPercent >= 66,
-      canStillPass: !(summary.meetsQuorum && summary.approvalPercent >= 66),
-      viewerCanVote: viewerIsMember && row.stage === 'approval',
+      voteSummary: built.summary,
+      passesApprovalThreshold: built.passes,
+      canStillPass: built.canStillPass,
+      viewerCanVote: viewerIsMember && (stage === 'approval' || stage === 'confirmation'),
       viewerCanRecordMerge:
-        Boolean(userId) &&
-        row.stage === 'awaiting-merge' &&
-        mergeIds.has(userId as string)
+        Boolean(userId) && stage === 'awaiting-merge' && mergeIds.has(userId as string)
     };
   });
 
   const { data: mergeRequests } = await db
     .from('project_merge_capability_change_requests')
-    .select('id, target_user_id, action, author_id, status, created_at')
+    .select(
+      'id, decision_id, target_user_id, action, author_id, status, approval_threshold_percent, created_at'
+    )
     .eq('project_id', projectId)
     .eq('status', 'open');
+  const mergeRequestIds = (mergeRequests ?? []).map((r) => String(r.id));
+  const mergeVotesByRequest = new Map<string, Array<{ vote?: string | null; voter_id?: string }>>();
+  if (mergeRequestIds.length) {
+    const { data: votes } = await db
+      .from('project_merge_capability_change_votes')
+      .select('request_id, voter_id, vote')
+      .in('request_id', mergeRequestIds);
+    for (const row of votes ?? []) {
+      const list = mergeVotesByRequest.get(String(row.request_id)) ?? [];
+      list.push({ vote: row.vote as string, voter_id: row.voter_id as string });
+      mergeVotesByRequest.set(String(row.request_id), list);
+    }
+  }
+
   const { data: repoRequests } = await db
     .from('project_repository_replacement_requests')
-    .select('id, repository_url, reason, author_id, status, created_at')
-    .eq('project_id', projectId)
-    .eq('status', 'open');
+    .select(
+      'id, decision_id, repository_url, previous_repository_url, reason, related_pull_request_id, author_id, status, approval_threshold_percent, created_at, updated_at'
+    )
+    .eq('project_id', projectId);
+
+  const openRepoRequests = (repoRequests ?? []).filter((r) => r.status === 'open');
+  const approvedRepoRequests = (repoRequests ?? []).filter((r) => r.status === 'approved');
+  const repoRequestIds = openRepoRequests.map((r) => String(r.id));
+  const repoVotesByRequest = new Map<string, Array<{ vote?: string | null; voter_id?: string }>>();
+  if (repoRequestIds.length) {
+    const { data: votes } = await db
+      .from('project_repository_replacement_votes')
+      .select('request_id, voter_id, vote')
+      .in('request_id', repoRequestIds);
+    for (const row of votes ?? []) {
+      const list = repoVotesByRequest.get(String(row.request_id)) ?? [];
+      list.push({ vote: row.vote as string, voter_id: row.voter_id as string });
+      repoVotesByRequest.set(String(row.request_id), list);
+    }
+  }
+
+  const relatedUserIdsForRequests = [
+    ...new Set(
+      [
+        ...(mergeRequests ?? []).flatMap((r) => [r.target_user_id as string, r.author_id as string]),
+        ...openRepoRequests.map((r) => r.author_id as string),
+        ...approvedRepoRequests.map((r) => r.author_id as string)
+      ].filter(Boolean)
+    )
+  ];
+  const names = await usernameMap(db, relatedUserIdsForRequests);
+
+  const mergeCapabilityChangeRequests = (mergeRequests ?? []).map((row) => {
+    const built = buildGovernanceVoteSummary(
+      mergeVotesByRequest.get(String(row.id)) ?? [],
+      userId,
+      population
+    );
+    const target = userById.get(row.target_user_id as string);
+    return {
+      id: row.id,
+      decisionId: row.decision_id,
+      action: row.action,
+      actionLabel:
+        row.action === 'grant' ? 'Grant merge capability' : 'Revoke merge capability',
+      targetMember: {
+        id: row.target_user_id,
+        username: target?.username ?? names.get(String(row.target_user_id)) ?? 'unknown',
+        bio: target?.bio ?? ''
+      },
+      authorUsername: names.get(String(row.author_id)) ?? 'unknown',
+      createdAt: row.created_at,
+      approvalThresholdPercent: Number(row.approval_threshold_percent ?? 66),
+      voteSummary: built.summary,
+      passesApprovalThreshold: built.passes,
+      canStillPass: built.canStillPass,
+      viewerCanVote: viewerIsMember && !built.passes
+    };
+  });
+
+  const repositoryReplacementRequests = openRepoRequests.map((row) => {
+    const built = buildGovernanceVoteSummary(
+      repoVotesByRequest.get(String(row.id)) ?? [],
+      userId,
+      population
+    );
+    return {
+      id: row.id,
+      decisionId: row.decision_id,
+      repositoryUrl: row.repository_url,
+      previousRepositoryUrl: row.previous_repository_url ?? '',
+      reason: row.reason ?? '',
+      relatedPullRequestId: row.related_pull_request_id,
+      authorUsername: names.get(String(row.author_id)) ?? 'unknown',
+      createdAt: row.created_at,
+      approvalThresholdPercent: Number(row.approval_threshold_percent ?? 66),
+      voteSummary: built.summary,
+      passesApprovalThreshold: built.passes,
+      canStillPass: built.canStillPass,
+      viewerCanVote: viewerIsMember && !built.passes
+    };
+  });
+
+  const repositoryHistory = approvedRepoRequests.map((row) => ({
+    id: row.id,
+    repositoryUrl: row.repository_url,
+    previousRepositoryUrl: row.previous_repository_url ?? '',
+    reason: row.reason ?? '',
+    relatedPullRequestId: row.related_pull_request_id,
+    replacedAt: row.updated_at ?? row.created_at,
+    replacedByUsername: names.get(String(row.author_id)) ?? 'unknown'
+  }));
 
   return {
     repositoryUrl,
@@ -860,20 +991,22 @@ async function hydrateSoftwareGovernance(
     mergeCapabilityManagedByPlatform: Boolean(project.is_platform_tagged),
     mergeCapabilityMembers,
     availableMergeCapabilityCandidates,
-    mergeCapabilityChangeRequests: mergeRequests ?? [],
-    repositoryReplacementRequests: (repoRequests ?? []).map((r) => ({
-      id: r.id,
-      proposedRepositoryUrl: r.repository_url,
-      reason: r.reason ?? '',
-      status: r.status,
-      createdAt: r.created_at
-    })),
-    replaceablePullRequests: pullRequests.filter((p) => p.stage !== 'merged'),
-    repositoryHistory: [],
+    mergeCapabilityChangeRequests,
+    repositoryReplacementRequests,
+    replaceablePullRequests: pullRequests
+      .filter((p) => p.stage === 'awaiting-merge')
+      .map((p) => ({
+        id: p.id,
+        title: p.title,
+        pullRequestId: p.pullRequestId,
+        stage: p.stage,
+        stageLabel: p.stageLabel
+      })),
+    repositoryHistory,
     pullRequests,
     viewerCanCreatePullRequests: viewerIsMember,
     viewerCanRequestMergeCapabilityChanges:
-      viewerIsMember && Boolean(userId && mergeIds.has(userId)),
+      viewerIsMember && !Boolean(project.is_platform_tagged),
     viewerCanRequestRepositoryReplacement: viewerIsMember
   };
 }
@@ -1377,21 +1510,25 @@ async function usernameMap(db: SupabaseClient, ids: Array<string | null | undefi
 }
 
 function voteSummaryPayload(
-  votes: Array<{ vote?: string | null; voter_id?: string | null }>,
-  viewerId: string | null
+  votes: Array<{ vote?: string | number | null; voter_id?: string | null }>,
+  viewerId: string | null,
+  population = 0
 ) {
-  const stats = summarizeVotes(votes);
-  const active = viewerId
-    ? (votes.find((v) => v.voter_id === viewerId)?.vote ?? null)
-    : null;
+  const { summary, passes, canStillPass } = buildGovernanceVoteSummary(
+    votes.map((row) => ({
+      vote: row.vote,
+      voter_id: row.voter_id ?? undefined
+    })),
+    viewerId,
+    population
+  );
   return {
-    yesCount: stats.yesCount,
-    noCount: stats.noCount,
-    totalVotes: stats.totalVotes,
-    approvalPercent: stats.approvalPercent,
-    activeVote: active === 'yes' || active === 'no' ? active : null,
-    requiredVotes: 0,
-    quorumMet: false
+    ...summary,
+    // Keep legacy aliases some older clients still read.
+    requiredVotes: summary.votesRequired,
+    quorumMet: summary.meetsQuorum,
+    passesApprovalThreshold: passes,
+    canStillPass
   };
 }
 
@@ -1402,7 +1539,8 @@ async function hydrateOpenRequests(
   foreignKey: 'project_id' | 'event_id',
   entityId: string,
   bodyKeys: string[],
-  viewerId: string | null
+  viewerId: string | null,
+  population = 0
 ) {
   const { data: rows } = await db
     .from(table)
@@ -1420,15 +1558,15 @@ async function hydrateOpenRequests(
       .from(voteTable)
       .select('vote, voter_id')
       .eq('request_id', req.id);
-    const summary = voteSummaryPayload(votes ?? [], viewerId);
+    const summary = voteSummaryPayload(votes ?? [], viewerId, population);
     const payload: Record<string, unknown> = {
       id: req.id,
       authorUsername: names.get(String(req.author_id)) ?? 'unknown',
       createdAt: req.created_at,
       approvalThresholdPercent: 66,
       voteSummary: summary,
-      passesApprovalThreshold: false,
-      canStillPass: true
+      passesApprovalThreshold: Boolean(summary.passesApprovalThreshold),
+      canStillPass: Boolean(summary.canStillPass)
     };
     for (const key of bodyKeys) {
       payload[key] = req[key] ?? req[key.replace(/[A-Z]/g, (m) => `_${m.toLowerCase()}`)] ?? '';
@@ -1441,7 +1579,8 @@ async function hydrateOpenRequests(
 export async function hydrateProjectUpdateRequests(
   db: SupabaseClient,
   projectId: string,
-  viewerId: string | null
+  viewerId: string | null,
+  population = 0
 ) {
   return hydrateOpenRequests(
     db,
@@ -1450,14 +1589,16 @@ export async function hydrateProjectUpdateRequests(
     'project_id',
     projectId,
     ['body'],
-    viewerId
+    viewerId,
+    population
   );
 }
 
 export async function hydrateProjectEditRequests(
   db: SupabaseClient,
   projectId: string,
-  viewerId: string | null
+  viewerId: string | null,
+  population = 0
 ) {
   return hydrateOpenRequests(
     db,
@@ -1466,14 +1607,16 @@ export async function hydrateProjectEditRequests(
     'project_id',
     projectId,
     ['title', 'description'],
-    viewerId
+    viewerId,
+    population
   );
 }
 
 export async function hydrateEventUpdateRequests(
   db: SupabaseClient,
   eventId: string,
-  viewerId: string | null
+  viewerId: string | null,
+  population = 0
 ) {
   return hydrateOpenRequests(
     db,
@@ -1482,14 +1625,16 @@ export async function hydrateEventUpdateRequests(
     'event_id',
     eventId,
     ['body'],
-    viewerId
+    viewerId,
+    population
   );
 }
 
 export async function hydrateEventEditRequests(
   db: SupabaseClient,
   eventId: string,
-  viewerId: string | null
+  viewerId: string | null,
+  population = 0
 ) {
   return hydrateOpenRequests(
     db,
@@ -1498,7 +1643,8 @@ export async function hydrateEventEditRequests(
     'event_id',
     eventId,
     ['title', 'description'],
-    viewerId
+    viewerId,
+    population
   );
 }
 
@@ -1545,6 +1691,128 @@ async function mapLinkRow(
   };
 }
 
+async function linkSideVoteState(
+  db: SupabaseClient,
+  requestId: string,
+  voteScope: 'source' | 'target',
+  title: string,
+  memberCount: number,
+  viewerId: string | null,
+  viewerIsMember: boolean,
+  subjectKind: 'project' | 'event',
+  subjectSlug: string,
+  statusLabel: string
+) {
+  const { data: votes } = await db
+    .from('detail_link_request_votes')
+    .select('vote, voter_id, vote_scope')
+    .eq('request_id', requestId)
+    .eq('vote_scope', voteScope);
+  const stats = summarizeVotes(votes ?? []);
+  const votesRequired = requiredVotes(Math.max(0, memberCount));
+  const approvalPercent = Math.round(stats.approvalRatio * 1000) / 10;
+  let viewerVote: 'yes' | 'no' | null = null;
+  if (viewerId) {
+    const mine = (votes ?? []).find((row) => row.voter_id === viewerId);
+    if (mine) {
+      if (mine.vote === 'yes' || mine.vote === 1 || mine.vote === '1') viewerVote = 'yes';
+      else if (mine.vote === 'no' || mine.vote === -1 || mine.vote === '-1') viewerVote = 'no';
+    }
+  }
+  const passes = stats.voteCount >= votesRequired && stats.voteCount > 0 && stats.approvalRatio >= 0.66;
+  const remainingEligible = Math.max(0, memberCount - stats.voteCount);
+  const maxYes = stats.yesCount + remainingEligible;
+  const maxTotal = stats.voteCount + remainingEligible;
+  const canStillPass =
+    !passes && maxTotal >= votesRequired && maxTotal > 0 && maxYes / maxTotal >= 0.66;
+  return {
+    projectTitle: title,
+    yesCount: stats.yesCount,
+    noCount: stats.noCount,
+    memberCount,
+    approvalsRequired: votesRequired,
+    approvalsRemaining: Math.max(0, votesRequired - stats.voteCount),
+    approvalPercent,
+    statusLabel,
+    resultNote: passes
+      ? 'Approved on this side.'
+      : canStillPass
+        ? 'Waiting for more approvals.'
+        : 'This side can no longer approve the request.',
+    viewerCanVote: Boolean(viewerId) && viewerIsMember && viewerVote == null,
+    viewerVote,
+    voteScope,
+    subjectKind,
+    subjectSlug,
+    passesApprovalThreshold: passes,
+    canStillPass
+  };
+}
+
+async function resolveLinkSubject(
+  db: SupabaseClient,
+  kind: string | null | undefined,
+  projectId: string | null | undefined,
+  eventId: string | null | undefined
+) {
+  if (kind === 'project' && projectId) {
+    const { data } = await db
+      .from('projects')
+      .select('id, slug, title, member_count, project_mode, stage_label, description, location_label')
+      .eq('id', projectId)
+      .maybeSingle();
+    if (data) {
+      return {
+        kind: 'project' as const,
+        id: String(data.id),
+        slug: String(data.slug),
+        title: String(data.title),
+        memberCount: Number(data.member_count ?? 0),
+        detail: {
+          kind: 'project',
+          slug: data.slug,
+          title: data.title,
+          description: data.description ?? '',
+          href: `/projects/${data.slug}`,
+          memberCount: Number(data.member_count ?? 0),
+          locationLabel: data.location_label ?? '',
+          projectMode: data.project_mode ?? 'productive',
+          stageLabel: data.stage_label ?? ''
+        }
+      };
+    }
+  }
+  if (kind === 'event' && eventId) {
+    const { data } = await db
+      .from('events')
+      .select('id, slug, title, member_count, current_phase_id, time_label, scheduled_at, description, location_label')
+      .eq('id', eventId)
+      .maybeSingle();
+    if (data) {
+      return {
+        kind: 'event' as const,
+        id: String(data.id),
+        slug: String(data.slug),
+        title: String(data.title),
+        memberCount: Number(data.member_count ?? 0),
+        detail: {
+          kind: 'event',
+          slug: data.slug,
+          title: data.title,
+          description: data.description ?? '',
+          href: `/events/${data.slug}`,
+          memberCount: Number(data.member_count ?? 0),
+          locationLabel: data.location_label ?? '',
+          stageLabel: String(data.current_phase_id ?? '').replace(/-/g, ' '),
+          timeLabel: data.time_label ?? '',
+          scheduledAt: data.scheduled_at ?? null
+        }
+      };
+    }
+  }
+  return null;
+}
+
 export async function buildLinksFrame(
   db: SupabaseClient,
   ownerKind: 'project' | 'event',
@@ -1553,6 +1821,9 @@ export async function buildLinksFrame(
   viewerId: string | null
 ) {
   const ownerId = owner.id as string;
+  const ownerSlug = String(owner.slug ?? '');
+  const ownerTitle = String(owner.title ?? 'Record');
+  const ownerMemberCount = Number(owner.member_count ?? 0);
   const sourceCol = ownerKind === 'project' ? 'source_project_id' : 'source_event_id';
   const { data: links } = await db.from('detail_links').select('*').eq(sourceCol, ownerId);
   const activeLinks = [];
@@ -1565,17 +1836,120 @@ export async function buildLinksFrame(
   const { data: pending } = await db
     .from('detail_link_requests')
     .select('*')
-    .eq(sourceCol, ownerId)
-    .eq('status', 'open')
-    .eq('request_type', 'create');
-  const pendingLinkRequests = (pending ?? []).map((req) => ({
-    id: req.id,
-    relationshipLabel: req.relationship_label,
-    summary: req.summary ?? '',
-    status: req.status,
-    requestType: req.request_type,
-    createdAt: req.created_at
-  }));
+    .or(
+      ownerKind === 'project'
+        ? `source_project_id.eq.${ownerId},target_project_id.eq.${ownerId}`
+        : `source_event_id.eq.${ownerId},target_event_id.eq.${ownerId}`
+    )
+    .eq('status', 'open');
+
+  const pendingLinkRequests: Array<Record<string, unknown>> = [];
+  for (const req of pending ?? []) {
+    const source = await resolveLinkSubject(
+      db,
+      String(req.source_kind ?? ''),
+      req.source_project_id as string | null,
+      req.source_event_id as string | null
+    );
+    const target = await resolveLinkSubject(
+      db,
+      String(req.target_kind ?? ''),
+      req.target_project_id as string | null,
+      req.target_event_id as string | null
+    );
+    if (!source || !target) continue;
+
+    const ownerIsSource =
+      (ownerKind === 'project' && req.source_project_id === ownerId) ||
+      (ownerKind === 'event' && req.source_event_id === ownerId);
+    const counterpart = ownerIsSource ? target : source;
+    const thisScope = ownerIsSource ? ('source' as const) : ('target' as const);
+    const otherScope = ownerIsSource ? ('target' as const) : ('source' as const);
+    const requestType = String(req.request_type ?? 'create');
+    const statusLabel =
+      requestType === 'sever' ? 'Sever open' : String(req.status ?? 'open').replace(/_/g, ' ');
+
+    let otherViewerIsMember = false;
+    if (viewerId) {
+      if (counterpart.kind === 'project') {
+        const { count } = await db
+          .from('project_memberships')
+          .select('*', { count: 'exact', head: true })
+          .eq('project_id', counterpart.id)
+          .eq('user_id', viewerId);
+        otherViewerIsMember = (count ?? 0) > 0;
+      } else {
+        const { count } = await db
+          .from('event_memberships')
+          .select('*', { count: 'exact', head: true })
+          .eq('event_id', counterpart.id)
+          .eq('user_id', viewerId);
+        otherViewerIsMember = (count ?? 0) > 0;
+      }
+    }
+
+    const thisRecordVote = await linkSideVoteState(
+      db,
+      String(req.id),
+      thisScope,
+      ownerTitle,
+      ownerMemberCount,
+      viewerId,
+      viewerIsMember,
+      ownerKind,
+      ownerSlug,
+      statusLabel
+    );
+    const otherRecordVote = await linkSideVoteState(
+      db,
+      String(req.id),
+      otherScope,
+      counterpart.title,
+      counterpart.memberCount,
+      viewerId,
+      otherViewerIsMember,
+      counterpart.kind,
+      counterpart.slug,
+      statusLabel
+    );
+    const yesCount = thisRecordVote.yesCount + otherRecordVote.yesCount;
+    const noCount = thisRecordVote.noCount + otherRecordVote.noCount;
+    const total = yesCount + noCount;
+    const approvalPercent = total > 0 ? Math.round((yesCount / total) * 1000) / 10 : 0;
+    const names = await usernameMap(db, [req.proposed_by as string | null]);
+
+    pendingLinkRequests.push({
+      id: req.id,
+      requestType,
+      linkId: req.link_id ?? null,
+      title: counterpart.title,
+      relationshipLabel: req.relationship_label,
+      summary: req.summary ?? '',
+      statusLabel,
+      proposedByUsername: names.get(String(req.proposed_by)) ?? 'unknown',
+      createdAtLabel: req.created_at,
+      createdAt: req.created_at,
+      targetHref: counterpart.detail.href,
+      targetKind: counterpart.kind,
+      targetDetail: counterpart.detail,
+      governanceTally: {
+        yesCount,
+        noCount,
+        approvalPercent,
+        label: total === 0 ? 'No votes yet' : `${Math.round(approvalPercent)}% · ${yesCount} yes / ${noCount} no`
+      },
+      sourceTitle: source.title,
+      targetTitle: target.title,
+      sourceVoteLabel: `${Math.round(Number(thisScope === 'source' ? thisRecordVote.approvalPercent : otherRecordVote.approvalPercent))}% · ${(thisScope === 'source' ? thisRecordVote : otherRecordVote).yesCount} yes / ${(thisScope === 'source' ? thisRecordVote : otherRecordVote).noCount} no`,
+      targetVoteLabel: `${Math.round(Number(thisScope === 'target' ? thisRecordVote.approvalPercent : otherRecordVote.approvalPercent))}% · ${(thisScope === 'target' ? thisRecordVote : otherRecordVote).yesCount} yes / ${(thisScope === 'target' ? thisRecordVote : otherRecordVote).noCount} no`,
+      thisRecordVote,
+      otherRecordVote,
+      targetProjectHref: counterpart.kind === 'project' ? counterpart.detail.href : null,
+      thisProjectVote: thisRecordVote,
+      otherProjectVote: otherRecordVote,
+      status: req.status
+    });
+  }
 
   let conversionNote = '';
   let conversionWorkflow: Array<Record<string, unknown>> = [];
@@ -1604,7 +1978,7 @@ export async function buildLinksFrame(
         inventoryNote:
           'Inventory, open requests, plans, signals, and roles stay on the predecessor.',
         canVote: viewerIsMember,
-        voteSummary: voteSummaryPayload(votes ?? [], viewerId),
+        voteSummary: voteSummaryPayload(votes ?? [], viewerId, Number(owner.member_count ?? 0)),
         approvalThresholdPercent: 66,
         target: {
           projectMode: req.conversion_target_mode,

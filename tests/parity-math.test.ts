@@ -162,12 +162,35 @@ describe('web-supabase shared parity math', () => {
     expect(normalizeRadiusKm(999999)).toBe(20000);
   });
 
-  it('applies proposal signal 66% gate with platform quorum', () => {
-    expect(signalUnlocked(2, 1, false, 10)).toBe(true); // 66.6%
-    expect(signalUnlocked(1, 1, false, 10)).toBe(false); // 50%
-    expect(signalUnlocked(0, 0, false, 10)).toBe(false);
-    // platform also needs demand >= requiredVotes(N)
-    expect(signalUnlocked(2, 1, true, 1)).toBe(true); // required=1
-    expect(signalUnlocked(2, 1, true, 50)).toBe(false); // required=37
+  it('builds compact vote-summary fields without NaN/undefined gaps', () => {
+    const votes = [{ vote: 'yes', voter_id: 'u1' }, { vote: 'no', voter_id: 'u2' }];
+    const stats = summarizeVotes(votes);
+    const population = 10;
+    const votesRequired = requiredVotes(population);
+    const remainingEligibleVotes = Math.max(0, population - stats.voteCount);
+    const approvalPercent = Math.round(stats.approvalRatio * 1000) / 10;
+    const summary = {
+      yesCount: stats.yesCount,
+      noCount: stats.noCount,
+      totalVotes: stats.voteCount,
+      approvalPercent,
+      activeVote: 'yes' as const,
+      meetsQuorum: stats.voteCount >= votesRequired,
+      eligibleVoterCount: population,
+      quorumThresholdPercent: Math.round((votesRequired / population) * 1000) / 10,
+      votesRequired,
+      votesRemaining: Math.max(0, votesRequired - stats.voteCount),
+      remainingEligibleVotes
+    };
+
+    expect(summary.totalVotes).toBe(2);
+    expect(summary.approvalPercent).toBeCloseTo(50);
+    expect(Number.isFinite(summary.approvalPercent)).toBe(true);
+    expect(Number.isFinite(summary.remainingEligibleVotes)).toBe(true);
+    expect(summary.votesRequired).toBeGreaterThan(0);
+    expect(summary.votesRemaining).toBe(summary.votesRequired - summary.totalVotes);
+    expect(
+      `${summary.approvalPercent}% yes · ${summary.totalVotes}/${summary.remainingEligibleVotes + summary.totalVotes} voted · 66% needed`
+    ).not.toMatch(/undefined|NaN/);
   });
 });

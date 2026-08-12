@@ -14,6 +14,7 @@ import {
 import { castReportVote, loadActiveReport, loadActiveReportsByTargetIds, reconcileReport } from './moderation.ts';
 import { handleFeedPage as assembleFeedPage, handleMapMarkers, viewerVote as feedViewerVote } from './feeds.ts';
 import { recordMeaningfulAction } from './votes.ts';
+import { buildActivityRail } from './activityRail.ts';
 
 type VoteDirection = -1 | 0 | 1;
 
@@ -155,8 +156,7 @@ export async function handleBootstrap(db: SupabaseClient, userId: string | null)
       communities: mapScope('community', communities)
     },
     suggestedContacts: [],
-    activityRail: [],
-    activityRailHistory: []
+    ...(await buildActivityRail(db, userId))
   };
 }
 
