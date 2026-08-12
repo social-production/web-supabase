@@ -1750,8 +1750,8 @@ Deno.serve(async (req) => {
     if (message === 'not_found' || message === 'invalid_invite' || message === 'invite_exhausted') {
       return error(message, 404);
     }
-    if (message === 'forbidden' || message === 'direct_invite_closed_only' || message === 'username_required' || message === 'invalid_vote' || message === 'cannot_vote_self' || message === 'role_full') {
-      return error(message, message === 'forbidden' || message === 'cannot_vote_self' || message === 'role_full' ? 403 : 422);
+    if (message === 'forbidden' || message === 'direct_invite_closed_only' || message === 'username_required' || message === 'invalid_vote' || message === 'role_full') {
+      return error(message, message === 'forbidden' || message === 'role_full' ? 403 : 422);
     }
     if (message === 'cannot_follow_self') {
       return error(message, 400);

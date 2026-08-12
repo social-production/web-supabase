@@ -149,7 +149,6 @@ export async function castBoardModeratorVote(
   vote: unknown
 ) {
   if (!targetUserId) throw new Error('not_found');
-  if (targetUserId === voterId) throw new Error('cannot_vote_self');
   const direction = normalizeYesNo(vote);
   const now = new Date().toISOString();
   if (direction === 0) {
