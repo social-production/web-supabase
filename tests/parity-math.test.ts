@@ -193,4 +193,61 @@ describe('web-supabase shared parity math', () => {
       `${summary.approvalPercent}% yes · ${summary.totalVotes}/${summary.remainingEligibleVotes + summary.totalVotes} voted · 66% needed`
     ).not.toMatch(/undefined|NaN/);
   });
+
+  it('maps linked-chat backend rows into inbox card fields', () => {
+    const item = {
+      id: 'p1',
+      kind: 'project' as const,
+      entity_id: 'p1',
+      entity_slug: 'demo',
+      title: 'Demo Project',
+      preview: 'hello',
+      last_message_at: '2026-08-12T00:00:00Z',
+      comment_count: 3,
+      unread_count: 2
+    };
+    const mapped = {
+      id: item.id,
+      kind: item.kind,
+      subjectId: item.entity_id,
+      title: item.title,
+      href: `/${item.kind}s/${item.entity_slug}`,
+      meta: `${item.comment_count} comments`,
+      preview: item.preview,
+      lastMessageAt: item.last_message_at,
+      unreadCount: item.unread_count,
+      comments: [] as unknown[]
+    };
+    expect(mapped.href).toBe('/projects/demo');
+    expect(mapped.meta).toBe('3 comments');
+    expect(mapped.unreadCount).toBe(2);
+  });
+
+  it('builds decision-history entry shape for update requests', () => {
+    const entry = {
+      id: 'req-1',
+      entityKind: 'project',
+      kind: 'project-update',
+      kindLabel: 'Update decision',
+      createdAt: '2026-08-12T00:00:00Z',
+      authorUsername: 'alice',
+      status: 'open',
+      approvalThresholdPercent: 66,
+      voteSummary: {
+        yesCount: 1,
+        noCount: 0,
+        totalVotes: 1,
+        approvalPercent: 100,
+        remainingEligibleVotes: 9
+      },
+      passesApprovalThreshold: false,
+      canStillPass: true,
+      canVote: true,
+      payload: { type: 'update', body: 'Ship it', appliedUpdateId: null }
+    };
+    expect(entry.kind).toBe('project-update');
+    expect(entry.authorUsername).toBe('alice');
+    expect(entry.payload.type).toBe('update');
+    expect(Number.isFinite(entry.voteSummary.remainingEligibleVotes)).toBe(true);
+  });
 });

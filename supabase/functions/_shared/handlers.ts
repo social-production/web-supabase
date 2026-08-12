@@ -15,6 +15,7 @@ import { castReportVote, loadActiveReport, loadActiveReportsByTargetIds, reconci
 import { handleFeedPage as assembleFeedPage, handleMapMarkers, viewerVote as feedViewerVote } from './feeds.ts';
 import { recordMeaningfulAction } from './votes.ts';
 import { buildActivityRail } from './activityRail.ts';
+import { buildLinkedChats } from './linkedChats.ts';
 
 type VoteDirection = -1 | 0 | 1;
 
@@ -46,15 +47,23 @@ async function loadViewer(db: SupabaseClient, userId: string | null) {
   };
 }
 
-async function unreadCounts(db: SupabaseClient, userId: string | null) {
+async function unreadCounts(
+  db: SupabaseClient,
+  userId: string | null,
+  options: { includeLinked?: boolean } = {}
+) {
   if (!userId) return { notifications: 0, messages: 0 };
-  const [{ count: notifications }, { data: memberships }] = await Promise.all([
+  const includeLinked = options.includeLinked === true;
+  const [{ count: notifications }, { data: memberships }, linked] = await Promise.all([
     db
       .from('notifications')
       .select('*', { count: 'exact', head: true })
       .eq('recipient_id', userId)
       .eq('is_unread', true),
-    db.from('conversation_members').select('conversation_id, last_read_at').eq('user_id', userId)
+    db.from('conversation_members').select('conversation_id, last_read_at').eq('user_id', userId),
+    includeLinked
+      ? buildLinkedChats(db, userId)
+      : Promise.resolve({ items: [] as Array<{ unread_count?: number }> })
   ]);
 
   let messages = 0;
@@ -70,6 +79,8 @@ async function unreadCounts(db: SupabaseClient, userId: string | null) {
     const { count } = await query;
     messages += count ?? 0;
   }
+
+  messages += linked.items.reduce((sum, item) => sum + Number(item.unread_count ?? 0), 0);
 
   return { notifications: notifications ?? 0, messages };
 }
@@ -156,8 +167,14 @@ export async function handleBootstrap(db: SupabaseClient, userId: string | null)
       communities: mapScope('community', communities)
     },
     suggestedContacts: [],
-    ...(await buildActivityRail(db, userId))
+    // Defer heavy rail assembly; clients load /bootstrap/activity-rail after first paint.
+    activityRail: [],
+    activityRailHistory: []
   };
+}
+
+export async function handleActivityRail(db: SupabaseClient, userId: string | null) {
+  return buildActivityRail(db, userId);
 }
 
 export async function handleBootstrapSummary(db: SupabaseClient, userId: string | null) {
@@ -923,13 +940,7 @@ export async function handleMessageContacts(db: SupabaseClient, userId: string, 
 }
 
 export async function handleLinkedChats(db: SupabaseClient, userId: string) {
-  const { data: comments } = await db.from('comments').select('id, subject_type, subject_id, body, created_at').order('created_at', { ascending: false }).limit(50);
-  const items = [];
-  for (const comment of comments ?? []) {
-    if (!(await canViewEntity(db, userId, comment.subject_type, comment.subject_id))) continue;
-    items.push({ id: comment.id, subjectType: comment.subject_type, subjectId: comment.subject_id, preview: comment.body, lastActivityAt: comment.created_at, unreadCount: 0 });
-  }
-  return { items };
+  return buildLinkedChats(db, userId);
 }
 
 export async function handleFollowRequests(db: SupabaseClient, userId: string) {

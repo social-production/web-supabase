@@ -3,6 +3,7 @@ import {
   handleAddComment,
   handleBootstrap,
   handleBootstrapSummary,
+  handleActivityRail,
   handleFollowRequests,
   handleGetComments,
   handleGetSettings,
@@ -24,6 +25,7 @@ import {
   handleUpdateSettings,
   loadViewer
 } from '../_shared/handlers.ts';
+import { mapLinkedChatToFrontend } from '../_shared/linkedChats.ts';
 import * as mutations from '../_shared/mutations.ts';
 import * as lifecycle from '../_shared/lifecycle.ts';
 import * as board from '../_shared/board.ts';
@@ -100,6 +102,9 @@ Deno.serve(async (req) => {
     }
     if (req.method === 'GET' && path === '/bootstrap/summary') {
       return json(await handleBootstrapSummary(db, userId));
+    }
+    if (req.method === 'GET' && path === '/bootstrap/activity-rail') {
+      return json(await handleActivityRail(db, userId));
     }
 
     // Feeds
@@ -430,10 +435,11 @@ Deno.serve(async (req) => {
         });
       }
       conversations.sort((a, b) => String(b.lastMessageAt).localeCompare(String(a.lastMessageAt)));
+      const linked = await handleLinkedChats(db, userId);
       return json({
         viewer,
         conversations,
-        linkedChats: [],
+        linkedChats: linked.items.map(mapLinkedChatToFrontend),
         suggestedContacts: [],
         activeConversationId: conversations[0]?.id ?? null
       });
@@ -647,10 +653,14 @@ Deno.serve(async (req) => {
         if (!data) return error('not_found', 404);
         if (!(await canViewEntity(db, userId, 'project', data.id))) return error('not_found', 404);
         const author = Array.isArray(data.users) ? data.users[0] : data.users;
-        const tags = await loadEntityTags(db, 'project', data.id);
-        const comments = await handleGetComments(db, userId, 'project', data.id);
         const viewerIsMember = userId ? await isProjectMember(db, data.id, userId) : false;
-        const activities = await hydrateActivities(db, 'project', data.id, userId);
+        const [tags, comments, activities, projectReport, activeVote] = await Promise.all([
+          loadEntityTags(db, 'project', data.id),
+          handleGetComments(db, userId, 'project', data.id),
+          hydrateActivities(db, 'project', data.id, userId),
+          loadActiveReport(db, 'project', data.id, userId),
+          viewerActiveVote(db, userId, 'project', data.id)
+        ]);
         const projectLifecycle = await buildProjectLifecycle(
           db,
           data,
@@ -658,7 +668,31 @@ Deno.serve(async (req) => {
           viewerIsMember,
           activities
         );
-        const projectReport = await loadActiveReport(db, 'project', data.id, userId);
+        const population = Number(projectLifecycle.voteContextPopulation ?? data.member_count ?? 0);
+        const [
+          updatesRes,
+          updateRequests,
+          editRequests,
+          linksFrame,
+          history,
+          membersRes
+        ] = await Promise.all([
+          db
+            .from('project_updates')
+            .select(
+              'id, title, body, created_at, author_id, users!fk_project_updates_author_id_users(username)'
+            )
+            .eq('project_id', data.id)
+            .order('created_at', { ascending: false }),
+          hydrateProjectUpdateRequests(db, data.id, userId, population),
+          hydrateProjectEditRequests(db, data.id, userId, population),
+          buildLinksFrame(db, 'project', data, viewerIsMember, userId),
+          hydrateProjectHistory(db, data.id, userId, population, viewerIsMember),
+          db
+            .from('project_memberships')
+            .select('user_id, users!fk_project_memberships_user_id_users(id, username, profile_image_url)')
+            .eq('project_id', data.id)
+        ]);
         const projectModeration = moderationFieldsFromRow(data, projectReport);
         return json({
           id: data.id,
@@ -673,7 +707,7 @@ Deno.serve(async (req) => {
           locationLabel: data.location_label ?? '',
           locationId: data.location_id,
           voteCount: data.vote_count ?? 0,
-          activeVote: await viewerActiveVote(db, userId, 'project', data.id),
+          activeVote,
           signalCount: data.signal_count ?? 0,
           commentCount: data.comment_count ?? 0,
           memberCount: data.member_count ?? 0,
@@ -681,7 +715,7 @@ Deno.serve(async (req) => {
           channelTags: tags.channelTags,
           communityTags: tags.communityTags,
           lifecycle: projectLifecycle,
-          updates: ((await db.from('project_updates').select('id, title, body, created_at, author_id, users!fk_project_updates_author_id_users(username)').eq('project_id', data.id).order('created_at', { ascending: false })).data ?? []).map((u) => {
+          updates: (updatesRes.data ?? []).map((u) => {
             const updateAuthor = Array.isArray(u.users) ? u.users[0] : u.users;
             return {
               id: u.id,
@@ -691,28 +725,22 @@ Deno.serve(async (req) => {
               createdAt: u.created_at
             };
           }),
-          updateRequests: await hydrateProjectUpdateRequests(
-            db,
-            data.id,
-            userId,
-            Number(projectLifecycle.voteContextPopulation ?? data.member_count ?? 0)
-          ),
+          updateRequests,
           viewerCanRequestUpdate: Boolean(userId),
           viewerCanVoteOnUpdateRequests: Boolean(userId),
-          editRequests: await hydrateProjectEditRequests(
-            db,
-            data.id,
-            userId,
-            Number(projectLifecycle.voteContextPopulation ?? data.member_count ?? 0)
-          ),
+          editRequests,
           viewerCanRequestEdit: Boolean(userId),
           viewerCanVoteOnEditRequests: Boolean(userId),
-          linksFrame: await buildLinksFrame(db, 'project', data, viewerIsMember, userId),
+          linksFrame,
           inventoryFrame: null,
-          history: await hydrateProjectHistory(db, data.id),
-          members: ((await db.from('project_memberships').select('user_id, users!fk_project_memberships_user_id_users(id, username, profile_image_url)').eq('project_id', data.id)).data ?? []).map((m) => {
+          history,
+          members: (membersRes.data ?? []).map((m) => {
             const u = Array.isArray(m.users) ? m.users[0] : m.users;
-            return { id: u?.id ?? m.user_id, username: u?.username ?? 'unknown', profileImageUrl: u?.profile_image_url ?? null };
+            return {
+              id: u?.id ?? m.user_id,
+              username: u?.username ?? 'unknown',
+              profileImageUrl: u?.profile_image_url ?? null
+            };
           }),
           viewerIsMember,
           viewerCanToggleMembership: Boolean(userId),
@@ -863,13 +891,16 @@ Deno.serve(async (req) => {
           lifecycle: eventLifecycle,
           attendanceNote: '',
           agenda: [],
-          updates: ((await db.from('event_updates').select('id, title, body, created_at').eq('event_id', data.id).order('created_at', { ascending: false })).data ?? []).map((u) => ({
-            id: u.id,
-            title: u.title,
-            body: u.body,
-            authorUsername: 'unknown',
-            createdAt: u.created_at
-          })),
+          updates: ((await db.from('event_updates').select('id, title, body, created_at, author_id, users!fk_event_updates_author_id_users(username)').eq('event_id', data.id).order('created_at', { ascending: false })).data ?? []).map((u) => {
+            const updateAuthor = Array.isArray(u.users) ? u.users[0] : u.users;
+            return {
+              id: u.id,
+              title: u.title,
+              body: u.body,
+              authorUsername: updateAuthor?.username ?? 'unknown',
+              createdAt: u.created_at
+            };
+          }),
           updateRequests: await hydrateEventUpdateRequests(
             db,
             data.id,
@@ -887,7 +918,14 @@ Deno.serve(async (req) => {
           viewerCanRequestEdit: Boolean(userId),
           viewerCanVoteOnEditRequests: Boolean(userId),
           linksFrame: await buildLinksFrame(db, 'event', data, viewerIsMember, userId),
-          history: await hydrateEventHistory(db, data.id),
+          history: await hydrateEventHistory(
+            db,
+            data.id,
+            userId,
+            Number(eventLifecycle.voteContextPopulation ?? data.member_count ?? 0),
+            viewerIsMember,
+            String(data.governance) === 'organizer_controlled'
+          ),
           attendees: [],
           invitedUsernames,
           eventEditors,

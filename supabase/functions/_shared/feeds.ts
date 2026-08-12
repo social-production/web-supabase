@@ -118,7 +118,60 @@ async function mapPost(db: SupabaseClient, userId: string | null, post: any, fee
   };
 }
 
-async function mapProject(db: SupabaseClient, userId: string | null, project: any) {
+function truncateUpdateBody(body: string, limit = 200) {
+  const text = String(body ?? '').trim();
+  if (text.length <= limit) return text;
+  return `${text.slice(0, limit - 1).trimEnd()}…`;
+}
+
+async function fetchLatestUpdates(
+  db: SupabaseClient,
+  projectIds: string[],
+  eventIds: string[]
+) {
+  const latest = new Map<string, { body: string; createdAt: string }>();
+
+  if (projectIds.length) {
+    const { data } = await db
+      .from('project_updates')
+      .select('project_id, body, created_at')
+      .in('project_id', projectIds)
+      .order('created_at', { ascending: false });
+    for (const row of data ?? []) {
+      const key = `project:${row.project_id}`;
+      if (latest.has(key)) continue;
+      latest.set(key, {
+        body: truncateUpdateBody(String(row.body ?? '')),
+        createdAt: String(row.created_at)
+      });
+    }
+  }
+
+  if (eventIds.length) {
+    const { data } = await db
+      .from('event_updates')
+      .select('event_id, body, created_at')
+      .in('event_id', eventIds)
+      .order('created_at', { ascending: false });
+    for (const row of data ?? []) {
+      const key = `event:${row.event_id}`;
+      if (latest.has(key)) continue;
+      latest.set(key, {
+        body: truncateUpdateBody(String(row.body ?? '')),
+        createdAt: String(row.created_at)
+      });
+    }
+  }
+
+  return latest;
+}
+
+async function mapProject(
+  db: SupabaseClient,
+  userId: string | null,
+  project: any,
+  latestUpdate?: { body: string; createdAt: string } | null
+) {
   if (!(await canViewByTags(db, userId, 'project', project.id))) return null;
   const author = Array.isArray(project.users) ? project.users[0] : project.users;
   const tags = await loadEntityTags(db, 'project', project.id);
@@ -150,11 +203,22 @@ async function mapProject(db: SupabaseClient, userId: string | null, project: an
     memberCount: project.member_count ?? 0,
     lastActivityAt: project.last_activity_at ?? project.created_at,
     isClosed: Boolean(project.is_closed),
+    ...(latestUpdate
+      ? {
+          latestDescription: latestUpdate.body,
+          latestUpdateAt: latestUpdate.createdAt
+        }
+      : {}),
     ...mapModeration(project, report)
   };
 }
 
-async function mapEvent(db: SupabaseClient, userId: string | null, event: any) {
+async function mapEvent(
+  db: SupabaseClient,
+  userId: string | null,
+  event: any,
+  latestUpdate?: { body: string; createdAt: string } | null
+) {
   if (!(await canViewPrivateEvent(db, userId, event))) return null;
   if (!event.is_private && !(await canViewByTags(db, userId, 'event', event.id))) return null;
   const author = Array.isArray(event.users) ? event.users[0] : event.users;
@@ -186,6 +250,12 @@ async function mapEvent(db: SupabaseClient, userId: string | null, event: any) {
     commentCount: event.comment_count ?? 0,
     memberCount: event.member_count ?? 0,
     lastActivityAt: event.last_activity_at ?? event.created_at,
+    ...(latestUpdate
+      ? {
+          latestUpdateBody: latestUpdate.body,
+          latestUpdateAt: latestUpdate.createdAt
+        }
+      : {}),
     ...mapModeration(event, report)
   };
 }
@@ -491,9 +561,19 @@ async function collectCandidates(
       if (opts.authorIds) q = q.in('author_id', opts.authorIds);
       if (projectScopeIds) q = q.in('id', [...projectScopeIds]);
       const { data } = await q;
-      for (const project of data ?? []) {
-        if (!inScope('project', project.id)) continue;
-        const mapped = await mapProject(db, userId, project);
+      const scopedProjects = (data ?? []).filter((project) => inScope('project', project.id));
+      const latestUpdates = await fetchLatestUpdates(
+        db,
+        scopedProjects.map((project) => String(project.id)),
+        []
+      );
+      for (const project of scopedProjects) {
+        const mapped = await mapProject(
+          db,
+          userId,
+          project,
+          latestUpdates.get(`project:${project.id}`) ?? null
+        );
         if (mapped) items.push({ sortAt: mapped.lastActivityAt, item: mapped });
       }
     }
@@ -513,9 +593,19 @@ async function collectCandidates(
       if (opts.authorIds) q = q.in('created_by', opts.authorIds);
       if (eventScopeIds) q = q.in('id', [...eventScopeIds]);
       const { data } = await q;
-      for (const event of data ?? []) {
-        if (!inScope('event', event.id)) continue;
-        const mapped = await mapEvent(db, userId, event);
+      const scopedEvents = (data ?? []).filter((event) => inScope('event', event.id));
+      const latestUpdates = await fetchLatestUpdates(
+        db,
+        [],
+        scopedEvents.map((event) => String(event.id))
+      );
+      for (const event of scopedEvents) {
+        const mapped = await mapEvent(
+          db,
+          userId,
+          event,
+          latestUpdates.get(`event:${event.id}`) ?? null
+        );
         if (mapped) items.push({ sortAt: mapped.lastActivityAt, item: mapped });
       }
     }

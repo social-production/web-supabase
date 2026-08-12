@@ -2059,44 +2059,349 @@ export async function buildLinksFrame(
   };
 }
 
-export async function hydrateProjectHistory(db: SupabaseClient, projectId: string) {
-  const { data: updates } = await db
-    .from('project_updates')
-    .select('id, title, body, created_at, author_id')
+export async function hydrateProjectHistory(
+  db: SupabaseClient,
+  projectId: string,
+  userId: string | null = null,
+  population = 0,
+  viewerIsMember = false
+) {
+  type HistoryEntry = Record<string, unknown>;
+  const entries: Array<{ createdAt: string; entry: HistoryEntry }> = [];
+  const phaseTitleMap = Object.fromEntries(PROJECT_PHASES.map((p) => [p.id, p.title]));
+
+  const { data: updateRequests } = await db
+    .from('project_update_requests')
+    .select('id, body, author_id, status, created_at')
     .eq('project_id', projectId)
-    .order('created_at', { ascending: false })
-    .limit(50);
-  const names = await usernameMap(
-    db,
-    (updates ?? []).map((u) => u.author_id as string | null)
-  );
-  return (updates ?? []).map((u) => ({
-    id: u.id,
-    kind: 'update',
-    title: u.title,
-    body: u.body,
-    authorUsername: names.get(String(u.author_id)) ?? 'unknown',
-    createdAt: u.created_at
-  }));
+    .order('created_at', { ascending: false });
+  const updateIds = (updateRequests ?? []).map((r) => String(r.id));
+  const updateVotes = new Map<string, Array<{ vote?: string | null; voter_id?: string }>>();
+  if (updateIds.length) {
+    const { data: votes } = await db
+      .from('project_update_request_votes')
+      .select('request_id, voter_id, vote')
+      .in('request_id', updateIds);
+    for (const row of votes ?? []) {
+      const list = updateVotes.get(String(row.request_id)) ?? [];
+      list.push({ vote: row.vote as string, voter_id: row.voter_id as string });
+      updateVotes.set(String(row.request_id), list);
+    }
+  }
+
+  const { data: editRequests } = await db
+    .from('project_edit_requests')
+    .select('id, title, description, author_id, status, created_at')
+    .eq('project_id', projectId)
+    .order('created_at', { ascending: false });
+  const editIds = (editRequests ?? []).map((r) => String(r.id));
+  const editVotes = new Map<string, Array<{ vote?: string | null; voter_id?: string }>>();
+  if (editIds.length) {
+    const { data: votes } = await db
+      .from('project_edit_request_votes')
+      .select('request_id, voter_id, vote')
+      .in('request_id', editIds);
+    for (const row of votes ?? []) {
+      const list = editVotes.get(String(row.request_id)) ?? [];
+      list.push({ vote: row.vote as string, voter_id: row.voter_id as string });
+      editVotes.set(String(row.request_id), list);
+    }
+  }
+
+  const { data: phaseRequests } = await db
+    .from('project_phase_change_requests')
+    .select(
+      'id, from_phase_id, target_phase_id, change_kind, reason, author_id, status, created_at'
+    )
+    .eq('project_id', projectId)
+    .order('created_at', { ascending: false });
+  const phaseIds = (phaseRequests ?? []).map((r) => String(r.id));
+  const phaseVotes = new Map<string, Array<{ vote?: string | null; voter_id?: string }>>();
+  if (phaseIds.length) {
+    const { data: votes } = await db
+      .from('project_phase_change_votes')
+      .select('request_id, voter_id, vote')
+      .in('request_id', phaseIds);
+    for (const row of votes ?? []) {
+      const list = phaseVotes.get(String(row.request_id)) ?? [];
+      list.push({ vote: row.vote as string, voter_id: row.voter_id as string });
+      phaseVotes.set(String(row.request_id), list);
+    }
+  }
+
+  const authorIds = [
+    ...(updateRequests ?? []).map((r) => r.author_id as string | null),
+    ...(editRequests ?? []).map((r) => r.author_id as string | null),
+    ...(phaseRequests ?? []).map((r) => r.author_id as string | null)
+  ];
+  const names = await usernameMap(db, authorIds);
+
+  for (const req of updateRequests ?? []) {
+    const built = buildGovernanceVoteSummary(
+      updateVotes.get(String(req.id)) ?? [],
+      userId,
+      population
+    );
+    entries.push({
+      createdAt: String(req.created_at),
+      entry: {
+        id: req.id,
+        entityKind: 'project',
+        kind: 'project-update',
+        kindLabel: 'Update decision',
+        createdAt: req.created_at,
+        authorUsername: names.get(String(req.author_id)) ?? 'unknown',
+        status: req.status,
+        approvalThresholdPercent: 66,
+        voteSummary: built.summary,
+        passesApprovalThreshold: built.passes,
+        canStillPass: built.canStillPass,
+        canVote: viewerIsMember && req.status === 'open',
+        payload: { type: 'update', body: req.body, appliedUpdateId: null }
+      }
+    });
+  }
+
+  for (const req of editRequests ?? []) {
+    const built = buildGovernanceVoteSummary(
+      editVotes.get(String(req.id)) ?? [],
+      userId,
+      population
+    );
+    entries.push({
+      createdAt: String(req.created_at),
+      entry: {
+        id: req.id,
+        entityKind: 'project',
+        kind: 'project-edit',
+        kindLabel: 'Edit decision',
+        createdAt: req.created_at,
+        authorUsername: names.get(String(req.author_id)) ?? 'unknown',
+        status: req.status,
+        approvalThresholdPercent: 66,
+        voteSummary: built.summary,
+        passesApprovalThreshold: built.passes,
+        canStillPass: built.canStillPass,
+        canVote: viewerIsMember && req.status === 'open',
+        payload: {
+          type: 'edit',
+          changes: [
+            { label: 'Title', before: '', after: req.title },
+            { label: 'Description', before: '', after: req.description }
+          ]
+        }
+      }
+    });
+  }
+
+  for (const req of phaseRequests ?? []) {
+    const built = buildGovernanceVoteSummary(
+      phaseVotes.get(String(req.id)) ?? [],
+      userId,
+      population
+    );
+    entries.push({
+      createdAt: String(req.created_at),
+      entry: {
+        id: req.id,
+        entityKind: 'project',
+        kind: 'project-phase-change',
+        kindLabel: 'Phase decision',
+        createdAt: req.created_at,
+        authorUsername: names.get(String(req.author_id)) ?? 'unknown',
+        status: req.status,
+        approvalThresholdPercent: 66,
+        voteSummary: built.summary,
+        passesApprovalThreshold: built.passes,
+        canStillPass: built.canStillPass,
+        canVote: viewerIsMember && req.status === 'open',
+        payload: {
+          type: 'phase-change',
+          changeKind: req.change_kind,
+          fromPhaseId: req.from_phase_id,
+          fromPhaseLabel: phaseTitleMap[String(req.from_phase_id)] ?? req.from_phase_id,
+          toPhaseId: req.target_phase_id,
+          toPhaseLabel: phaseTitleMap[String(req.target_phase_id)] ?? req.target_phase_id,
+          reason: req.reason
+        }
+      }
+    });
+  }
+
+  entries.sort((a, b) => String(b.createdAt).localeCompare(String(a.createdAt)));
+  return entries.map((item) => item.entry);
 }
 
-export async function hydrateEventHistory(db: SupabaseClient, eventId: string) {
-  const { data: updates } = await db
-    .from('event_updates')
-    .select('id, title, body, created_at, author_id')
+export async function hydrateEventHistory(
+  db: SupabaseClient,
+  eventId: string,
+  userId: string | null = null,
+  population = 0,
+  viewerIsMember = false,
+  isOrganizerControlled = false
+) {
+  type HistoryEntry = Record<string, unknown>;
+  const entries: Array<{ createdAt: string; entry: HistoryEntry }> = [];
+  const phaseTitleMap = Object.fromEntries(EVENT_PHASES.map((p) => [p.id, p.title]));
+  const canVoteOpen = viewerIsMember && !isOrganizerControlled;
+
+  const { data: updateRequests } = await db
+    .from('event_update_requests')
+    .select('id, body, author_id, status, created_at')
     .eq('event_id', eventId)
-    .order('created_at', { ascending: false })
-    .limit(50);
-  const names = await usernameMap(
-    db,
-    (updates ?? []).map((u) => u.author_id as string | null)
-  );
-  return (updates ?? []).map((u) => ({
-    id: u.id,
-    kind: 'update',
-    title: u.title,
-    body: u.body,
-    authorUsername: names.get(String(u.author_id)) ?? 'unknown',
-    createdAt: u.created_at
-  }));
+    .order('created_at', { ascending: false });
+  const updateIds = (updateRequests ?? []).map((r) => String(r.id));
+  const updateVotes = new Map<string, Array<{ vote?: string | null; voter_id?: string }>>();
+  if (updateIds.length) {
+    const { data: votes } = await db
+      .from('event_update_request_votes')
+      .select('request_id, voter_id, vote')
+      .in('request_id', updateIds);
+    for (const row of votes ?? []) {
+      const list = updateVotes.get(String(row.request_id)) ?? [];
+      list.push({ vote: row.vote as string, voter_id: row.voter_id as string });
+      updateVotes.set(String(row.request_id), list);
+    }
+  }
+
+  const { data: editRequests } = await db
+    .from('event_edit_requests')
+    .select('id, title, description, author_id, status, created_at')
+    .eq('event_id', eventId)
+    .order('created_at', { ascending: false });
+  const editIds = (editRequests ?? []).map((r) => String(r.id));
+  const editVotes = new Map<string, Array<{ vote?: string | null; voter_id?: string }>>();
+  if (editIds.length) {
+    const { data: votes } = await db
+      .from('event_edit_request_votes')
+      .select('request_id, voter_id, vote')
+      .in('request_id', editIds);
+    for (const row of votes ?? []) {
+      const list = editVotes.get(String(row.request_id)) ?? [];
+      list.push({ vote: row.vote as string, voter_id: row.voter_id as string });
+      editVotes.set(String(row.request_id), list);
+    }
+  }
+
+  const { data: phaseRequests } = await db
+    .from('event_phase_change_requests')
+    .select(
+      'id, from_phase_id, target_phase_id, change_kind, reason, author_id, status, created_at'
+    )
+    .eq('event_id', eventId)
+    .order('created_at', { ascending: false });
+  const phaseIds = (phaseRequests ?? []).map((r) => String(r.id));
+  const phaseVotes = new Map<string, Array<{ vote?: string | null; voter_id?: string }>>();
+  if (phaseIds.length) {
+    const { data: votes } = await db
+      .from('event_phase_change_votes')
+      .select('request_id, voter_id, vote')
+      .in('request_id', phaseIds);
+    for (const row of votes ?? []) {
+      const list = phaseVotes.get(String(row.request_id)) ?? [];
+      list.push({ vote: row.vote as string, voter_id: row.voter_id as string });
+      phaseVotes.set(String(row.request_id), list);
+    }
+  }
+
+  const names = await usernameMap(db, [
+    ...(updateRequests ?? []).map((r) => r.author_id as string | null),
+    ...(editRequests ?? []).map((r) => r.author_id as string | null),
+    ...(phaseRequests ?? []).map((r) => r.author_id as string | null)
+  ]);
+
+  for (const req of updateRequests ?? []) {
+    const built = buildGovernanceVoteSummary(
+      updateVotes.get(String(req.id)) ?? [],
+      userId,
+      population
+    );
+    entries.push({
+      createdAt: String(req.created_at),
+      entry: {
+        id: req.id,
+        entityKind: 'event',
+        kind: 'event-update',
+        kindLabel: 'Update decision',
+        createdAt: req.created_at,
+        authorUsername: names.get(String(req.author_id)) ?? 'unknown',
+        status: req.status,
+        approvalThresholdPercent: 66,
+        voteSummary: built.summary,
+        passesApprovalThreshold: built.passes,
+        canStillPass: built.canStillPass,
+        canVote: canVoteOpen && req.status === 'open',
+        payload: { type: 'update', body: req.body, appliedUpdateId: null }
+      }
+    });
+  }
+
+  for (const req of editRequests ?? []) {
+    const built = buildGovernanceVoteSummary(
+      editVotes.get(String(req.id)) ?? [],
+      userId,
+      population
+    );
+    entries.push({
+      createdAt: String(req.created_at),
+      entry: {
+        id: req.id,
+        entityKind: 'event',
+        kind: 'event-edit',
+        kindLabel: 'Edit decision',
+        createdAt: req.created_at,
+        authorUsername: names.get(String(req.author_id)) ?? 'unknown',
+        status: req.status,
+        approvalThresholdPercent: 66,
+        voteSummary: built.summary,
+        passesApprovalThreshold: built.passes,
+        canStillPass: built.canStillPass,
+        canVote: canVoteOpen && req.status === 'open',
+        payload: {
+          type: 'edit',
+          changes: [
+            { label: 'Title', before: '', after: req.title },
+            { label: 'Description', before: '', after: req.description }
+          ]
+        }
+      }
+    });
+  }
+
+  for (const req of phaseRequests ?? []) {
+    const built = buildGovernanceVoteSummary(
+      phaseVotes.get(String(req.id)) ?? [],
+      userId,
+      population
+    );
+    entries.push({
+      createdAt: String(req.created_at),
+      entry: {
+        id: req.id,
+        entityKind: 'event',
+        kind: 'event-phase-change',
+        kindLabel: 'Phase decision',
+        createdAt: req.created_at,
+        authorUsername: names.get(String(req.author_id)) ?? 'unknown',
+        status: req.status,
+        approvalThresholdPercent: 66,
+        voteSummary: built.summary,
+        passesApprovalThreshold: built.passes,
+        canStillPass: built.canStillPass,
+        canVote: canVoteOpen && req.status === 'open',
+        payload: {
+          type: 'phase-change',
+          changeKind: req.change_kind,
+          fromPhaseId: req.from_phase_id,
+          fromPhaseLabel: phaseTitleMap[String(req.from_phase_id)] ?? req.from_phase_id,
+          toPhaseId: req.target_phase_id,
+          toPhaseLabel: phaseTitleMap[String(req.target_phase_id)] ?? req.target_phase_id,
+          reason: req.reason
+        }
+      }
+    });
+  }
+
+  entries.sort((a, b) => String(b.createdAt).localeCompare(String(a.createdAt)));
+  return entries.map((item) => item.entry);
 }
