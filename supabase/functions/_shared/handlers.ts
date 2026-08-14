@@ -272,33 +272,50 @@ export async function handleSetVote(
   return { ok: true, voteCount, activeVote: direction };
 }
 
-async function mapCommentTree(
+async function loadViewerVotes(
   db: SupabaseClient,
   userId: string | null,
+  targetType: string,
+  targetIds: string[]
+): Promise<Map<string, VoteDirection>> {
+  const votes = new Map<string, VoteDirection>();
+  if (!userId || targetIds.length === 0) return votes;
+  const { data } = await db
+    .from('content_votes')
+    .select('target_id, direction')
+    .eq('target_type', targetType)
+    .eq('voter_id', userId)
+    .in('target_id', targetIds);
+  for (const row of data ?? []) {
+    votes.set(String(row.target_id), Number(row.direction ?? 0) as VoteDirection);
+  }
+  return votes;
+}
+
+function mapCommentTree(
   rows: Array<Record<string, any>>,
-  parentId: string | null = null,
-  reportById: Map<string, Awaited<ReturnType<typeof loadActiveReport>>> = new Map()
-): Promise<unknown[]> {
+  parentId: string | null,
+  reportById: Map<string, Awaited<ReturnType<typeof loadActiveReport>>>,
+  voteById: Map<string, VoteDirection>
+): unknown[] {
   const children = rows.filter((row) => (row.parent_id ?? null) === parentId);
-  const result = [];
-  for (const row of children) {
+  return children.map((row) => {
     const author = Array.isArray(row.users) ? row.users[0] : row.users;
     const report = reportById.get(String(row.id)) ?? null;
-    result.push({
+    return {
       id: row.id,
       authorUsername: author?.username ?? 'unknown',
       body: row.body,
       createdAt: row.created_at,
       voteCount: row.vote_count ?? 0,
-      activeVote: await viewerVote(db, userId, 'comment', row.id),
+      activeVote: voteById.get(String(row.id)) ?? 0,
       report,
       hasActiveReport: Boolean(report),
       isUnderReview: row.moderation_state === 'under_review' || report?.resolution === 'under_review',
       moderationState: row.moderation_state ?? 'visible',
-      replies: await mapCommentTree(db, userId, rows, row.id, reportById)
-    });
-  }
-  return result;
+      replies: mapCommentTree(rows, row.id, reportById, voteById)
+    };
+  });
 }
 
 export async function handleGetComments(
@@ -326,7 +343,13 @@ export async function handleGetComments(
     rows.map((row) => String(row.id)),
     userId
   );
-  return mapCommentTree(db, userId, rows, null, reportById);
+  const voteById = await loadViewerVotes(
+    db,
+    userId,
+    'comment',
+    rows.map((row) => String(row.id))
+  );
+  return mapCommentTree(rows, null, reportById, voteById);
 }
 
 export async function handleAddComment(

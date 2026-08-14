@@ -1,4 +1,5 @@
 import { createClient, type SupabaseClient } from 'https://esm.sh/@supabase/supabase-js@2.49.1';
+import { userIdFromSignedAccessToken } from './jwt.ts';
 
 export function createServiceClient(): SupabaseClient {
   const url = Deno.env.get('SUPABASE_URL') ?? Deno.env.get('SB_URL') ?? '';
@@ -31,6 +32,11 @@ export async function requireUserId(
 ): Promise<string | null> {
   if (!authHeader?.startsWith('Bearer ')) return null;
   const token = authHeader.slice('Bearer '.length);
+  const secret =
+    Deno.env.get('SUPABASE_JWT_SECRET') ?? Deno.env.get('JWT_SECRET') ?? '';
+  if (secret) {
+    return userIdFromSignedAccessToken(token, secret);
+  }
   const { data, error } = await service.auth.getUser(token);
   if (error || !data.user) return null;
   return data.user.id;

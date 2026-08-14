@@ -70,18 +70,35 @@ function summarizeRows(rows: Array<{ vote?: string | number | null }>) {
 async function loadVoteMap(
   db: SupabaseClient,
   table: string,
-  requestIds: string[]
+  requestIds: string[],
+  idColumn = 'request_id'
 ) {
   const map = new Map<string, Array<{ vote?: string | number | null; voter_id?: string }>>();
   if (requestIds.length === 0) return map;
-  const { data } = await db.from(table).select('request_id, voter_id, vote').in('request_id', requestIds);
+  const { data } = await db.from(table).select(`${idColumn}, voter_id, vote`).in(idColumn, requestIds);
   for (const row of data ?? []) {
-    const id = String(row.request_id);
+    const id = String((row as Record<string, unknown>)[idColumn] ?? '');
+    if (!id) continue;
     const list = map.get(id) ?? [];
     list.push({ vote: row.vote as string | number | null, voter_id: row.voter_id as string });
     map.set(id, list);
   }
   return map;
+}
+
+async function loadRatedPlanIds(
+  db: SupabaseClient,
+  table: string,
+  planIds: string[],
+  userId: string
+) {
+  const rated = new Set<string>();
+  if (planIds.length === 0) return rated;
+  const { data } = await db.from(table).select('plan_id').eq('voter_id', userId).in('plan_id', planIds);
+  for (const row of data ?? []) {
+    rated.add(String(row.plan_id));
+  }
+  return rated;
 }
 
 function viewerAlreadyVoted(
@@ -414,7 +431,7 @@ async function loadScheduledActivityRail(
       .in('id', projectIds);
     const parentById = new Map((projects ?? []).map((row) => [String(row.id), row as ActivityParent]));
     const activeProjectIds = (projects ?? [])
-      .filter((row) => !row.is_closed && row.current_phase_id === 'phase-5')
+      .filter((row) => !row.is_closed)
       .map((row) => String(row.id));
     if (activeProjectIds.length > 0) {
       const { data: activities } = await db
@@ -542,36 +559,58 @@ async function buildActivityRailImpl(
   const items: RailItem[] = [];
   const limit = 8;
 
-  const { data: projectMemberships } = await db
-    .from('project_memberships')
-    .select('project_id')
-    .eq('user_id', userId);
+  const [{ data: projectMemberships }, { data: eventMemberships }] = await Promise.all([
+    db.from('project_memberships').select('project_id').eq('user_id', userId),
+    db.from('event_memberships').select('event_id').eq('user_id', userId)
+  ]);
   const projectIds = [...new Set((projectMemberships ?? []).map((row) => String(row.project_id)))];
-
-  const { data: eventMemberships } = await db
-    .from('event_memberships')
-    .select('event_id')
-    .eq('user_id', userId);
   const eventIds = [...new Set((eventMemberships ?? []).map((row) => String(row.event_id)))];
 
   if (projectIds.length > 0) {
-    const { data: projects } = await db
-      .from('projects')
-      .select('id, slug, title, current_phase_id, is_closed')
-      .in('id', projectIds)
-      .eq('is_closed', false);
+    const [
+      { data: projects },
+      { data: phaseRequests },
+      { data: updateRequests },
+      { data: editRequests }
+    ] = await Promise.all([
+      db
+        .from('projects')
+        .select('id, slug, title, current_phase_id, is_closed')
+        .in('id', projectIds)
+        .eq('is_closed', false),
+      db
+        .from('project_phase_change_requests')
+        .select('id, project_id, target_phase_id, created_at, status')
+        .in('project_id', projectIds)
+        .eq('status', 'open')
+        .order('created_at', { ascending: false })
+        .limit(limit),
+      db
+        .from('project_update_requests')
+        .select('id, project_id, body, created_at, status')
+        .in('project_id', projectIds)
+        .eq('status', 'open')
+        .order('created_at', { ascending: false })
+        .limit(limit),
+      db
+        .from('project_edit_requests')
+        .select('id, project_id, title, created_at, status')
+        .in('project_id', projectIds)
+        .eq('status', 'open')
+        .order('created_at', { ascending: false })
+        .limit(limit)
+    ]);
     const projectById = new Map((projects ?? []).map((p) => [String(p.id), p]));
+    const phaseIds = (phaseRequests ?? []).map((r) => String(r.id));
+    const updateIds = (updateRequests ?? []).map((r) => String(r.id));
+    const editIds = (editRequests ?? []).map((r) => String(r.id));
+    const [phaseVotes, updateVotes, editVotes] = await Promise.all([
+      loadVoteMap(db, 'project_phase_change_votes', phaseIds),
+      loadVoteMap(db, 'project_update_request_votes', updateIds),
+      loadVoteMap(db, 'project_edit_request_votes', editIds)
+    ]);
 
     // Phase-change votes
-    const { data: phaseRequests } = await db
-      .from('project_phase_change_requests')
-      .select('id, project_id, target_phase_id, created_at, status')
-      .in('project_id', projectIds)
-      .eq('status', 'open')
-      .order('created_at', { ascending: false })
-      .limit(limit);
-    const phaseIds = (phaseRequests ?? []).map((r) => String(r.id));
-    const phaseVotes = await loadVoteMap(db, 'project_phase_change_votes', phaseIds);
     for (const req of phaseRequests ?? []) {
       if (viewerAlreadyVoted(phaseVotes.get(String(req.id)), userId)) continue;
       const project = projectById.get(String(req.project_id));
@@ -593,15 +632,6 @@ async function buildActivityRailImpl(
     }
 
     // Update votes
-    const { data: updateRequests } = await db
-      .from('project_update_requests')
-      .select('id, project_id, body, created_at, status')
-      .in('project_id', projectIds)
-      .eq('status', 'open')
-      .order('created_at', { ascending: false })
-      .limit(limit);
-    const updateIds = (updateRequests ?? []).map((r) => String(r.id));
-    const updateVotes = await loadVoteMap(db, 'project_update_request_votes', updateIds);
     for (const req of updateRequests ?? []) {
       if (viewerAlreadyVoted(updateVotes.get(String(req.id)), userId)) continue;
       const project = projectById.get(String(req.project_id));
@@ -623,15 +653,6 @@ async function buildActivityRailImpl(
     }
 
     // Edit votes
-    const { data: editRequests } = await db
-      .from('project_edit_requests')
-      .select('id, project_id, title, created_at, status')
-      .in('project_id', projectIds)
-      .eq('status', 'open')
-      .order('created_at', { ascending: false })
-      .limit(limit);
-    const editIds = (editRequests ?? []).map((r) => String(r.id));
-    const editVotes = await loadVoteMap(db, 'project_edit_request_votes', editIds);
     for (const req of editRequests ?? []) {
       if (viewerAlreadyVoted(editVotes.get(String(req.id)), userId)) continue;
       const project = projectById.get(String(req.project_id));
@@ -652,7 +673,7 @@ async function buildActivityRailImpl(
       });
     }
 
-    // Plan overall votes for planning phases
+    // Plan votes for planning phases — assess first, then overall
     const planningProjectIds = (projects ?? [])
       .filter((p) => p.current_phase_id === 'phase-2' || p.current_phase_id === 'phase-3')
       .map((p) => String(p.id));
@@ -661,11 +682,14 @@ async function buildActivityRailImpl(
         .from('project_plans')
         .select('id, project_id, title, created_at, status, phase_kind')
         .in('project_id', planningProjectIds)
-        .in('status', ['open', 'proposed', 'pending'])
+        .eq('status', 'open')
         .order('created_at', { ascending: false })
         .limit(limit);
       const planIds = (plans ?? []).map((p) => String(p.id));
-      const planVotes = await loadVoteMap(db, 'project_plan_votes', planIds);
+      const [planVotes, ratedPlanIds] = await Promise.all([
+        loadVoteMap(db, 'project_plan_votes', planIds, 'plan_id'),
+        loadRatedPlanIds(db, 'project_plan_criterion_ratings', planIds, userId)
+      ]);
       for (const plan of plans ?? []) {
         if (viewerAlreadyVoted(planVotes.get(String(plan.id)), userId)) continue;
         const project = projectById.get(String(plan.project_id));
@@ -673,6 +697,7 @@ async function buildActivityRailImpl(
         const tallies = summarizeRows(planVotes.get(String(plan.id)) ?? []);
         const planPhaseId =
           project.current_phase_id === 'phase-3' ? ('phase-3' as const) : ('phase-2' as const);
+        const voteSubKind = ratedPlanIds.has(String(plan.id)) ? ('overall' as const) : ('criterion' as const);
         items.push({
           id: String(plan.id),
           subjectId: String(project.id),
@@ -683,15 +708,18 @@ async function buildActivityRailImpl(
             String(project.slug),
             'plan',
             String(plan.id),
-            'voteSubKind=overall'
+            voteSubKind === 'overall' ? 'voteSubKind=overall&assess=1' : 'voteSubKind=criterion'
           ),
-          meta: String(plan.title ?? 'Plan approval').slice(0, 120),
+          meta:
+            voteSubKind === 'criterion'
+              ? 'Assess and approve this plan'
+              : `Approve “${String(plan.title ?? 'this plan')}”?`,
           createdAt: String(plan.created_at),
           countLabel: countLabel(tallies.yes, tallies.no),
           voteEntityKind: 'project',
           voteKindLabel: 'plan',
           voteTargetId: String(plan.id),
-          voteSubKind: 'overall',
+          voteSubKind,
           planPhaseId
         });
       }
@@ -699,21 +727,45 @@ async function buildActivityRailImpl(
   }
 
   if (eventIds.length > 0) {
-    const { data: events } = await db
-      .from('events')
-      .select('id, slug, title, current_phase_id')
-      .in('id', eventIds);
+    const [
+      { data: events },
+      { data: phaseRequests },
+      { data: updateRequests },
+      { data: editRequests }
+    ] = await Promise.all([
+      db.from('events').select('id, slug, title, current_phase_id').in('id', eventIds),
+      db
+        .from('event_phase_change_requests')
+        .select('id, event_id, target_phase_id, created_at, status')
+        .in('event_id', eventIds)
+        .eq('status', 'open')
+        .order('created_at', { ascending: false })
+        .limit(limit),
+      db
+        .from('event_update_requests')
+        .select('id, event_id, body, created_at, status')
+        .in('event_id', eventIds)
+        .eq('status', 'open')
+        .order('created_at', { ascending: false })
+        .limit(limit),
+      db
+        .from('event_edit_requests')
+        .select('id, event_id, title, created_at, status')
+        .in('event_id', eventIds)
+        .eq('status', 'open')
+        .order('created_at', { ascending: false })
+        .limit(limit)
+    ]);
     const eventById = new Map((events ?? []).map((e) => [String(e.id), e]));
-
-    const { data: phaseRequests } = await db
-      .from('event_phase_change_requests')
-      .select('id, event_id, target_phase_id, created_at, status')
-      .in('event_id', eventIds)
-      .eq('status', 'open')
-      .order('created_at', { ascending: false })
-      .limit(limit);
     const phaseIds = (phaseRequests ?? []).map((r) => String(r.id));
-    const phaseVotes = await loadVoteMap(db, 'event_phase_change_votes', phaseIds);
+    const updateIds = (updateRequests ?? []).map((r) => String(r.id));
+    const editIds = (editRequests ?? []).map((r) => String(r.id));
+    const [phaseVotes, updateVotes, editVotes] = await Promise.all([
+      loadVoteMap(db, 'event_phase_change_votes', phaseIds),
+      loadVoteMap(db, 'event_update_request_votes', updateIds),
+      loadVoteMap(db, 'event_edit_request_votes', editIds)
+    ]);
+
     for (const req of phaseRequests ?? []) {
       if (viewerAlreadyVoted(phaseVotes.get(String(req.id)), userId)) continue;
       const event = eventById.get(String(req.event_id));
@@ -734,15 +786,6 @@ async function buildActivityRailImpl(
       });
     }
 
-    const { data: updateRequests } = await db
-      .from('event_update_requests')
-      .select('id, event_id, body, created_at, status')
-      .in('event_id', eventIds)
-      .eq('status', 'open')
-      .order('created_at', { ascending: false })
-      .limit(limit);
-    const updateIds = (updateRequests ?? []).map((r) => String(r.id));
-    const updateVotes = await loadVoteMap(db, 'event_update_request_votes', updateIds);
     for (const req of updateRequests ?? []) {
       if (viewerAlreadyVoted(updateVotes.get(String(req.id)), userId)) continue;
       const event = eventById.get(String(req.event_id));
@@ -763,15 +806,6 @@ async function buildActivityRailImpl(
       });
     }
 
-    const { data: editRequests } = await db
-      .from('event_edit_requests')
-      .select('id, event_id, title, created_at, status')
-      .in('event_id', eventIds)
-      .eq('status', 'open')
-      .order('created_at', { ascending: false })
-      .limit(limit);
-    const editIds = (editRequests ?? []).map((r) => String(r.id));
-    const editVotes = await loadVoteMap(db, 'event_edit_request_votes', editIds);
     for (const req of editRequests ?? []) {
       if (viewerAlreadyVoted(editVotes.get(String(req.id)), userId)) continue;
       const event = eventById.get(String(req.event_id));
@@ -800,29 +834,42 @@ async function buildActivityRailImpl(
         .from('event_plans')
         .select('id, event_id, title, created_at, status')
         .in('event_id', planningEventIds)
-        .in('status', ['open', 'proposed', 'pending'])
+        .eq('status', 'open')
         .order('created_at', { ascending: false })
         .limit(limit);
       const planIds = (plans ?? []).map((p) => String(p.id));
-      const planVotes = await loadVoteMap(db, 'event_plan_votes', planIds);
+      const [planVotes, ratedPlanIds] = await Promise.all([
+        loadVoteMap(db, 'event_plan_votes', planIds, 'plan_id'),
+        loadRatedPlanIds(db, 'event_plan_criterion_ratings', planIds, userId)
+      ]);
       for (const plan of plans ?? []) {
         if (viewerAlreadyVoted(planVotes.get(String(plan.id)), userId)) continue;
         const event = eventById.get(String(plan.event_id));
         if (!event) continue;
         const tallies = summarizeRows(planVotes.get(String(plan.id)) ?? []);
+        const voteSubKind = ratedPlanIds.has(String(plan.id)) ? ('overall' as const) : ('criterion' as const);
         items.push({
           id: String(plan.id),
           subjectId: String(event.id),
           kind: 'vote',
           title: `Plan: ${event.title}`,
-          href: voteHref('events', String(event.slug), 'plan', String(plan.id), 'voteSubKind=overall'),
-          meta: String(plan.title ?? 'Plan approval').slice(0, 120),
+          href: voteHref(
+            'events',
+            String(event.slug),
+            'plan',
+            String(plan.id),
+            voteSubKind === 'overall' ? 'voteSubKind=overall&assess=1' : 'voteSubKind=criterion'
+          ),
+          meta:
+            voteSubKind === 'criterion'
+              ? 'Assess and approve this plan'
+              : `Approve “${String(plan.title ?? 'this plan')}”?`,
           createdAt: String(plan.created_at),
           countLabel: countLabel(tallies.yes, tallies.no),
           voteEntityKind: 'event',
           voteKindLabel: 'plan',
           voteTargetId: String(plan.id),
-          voteSubKind: 'overall'
+          voteSubKind
         });
       }
     }
@@ -1098,8 +1145,10 @@ async function buildActivityRailImpl(
     }
   }
 
-  const helpRail = await loadHelpRequestRail(db, userId);
-  const activityRailItems = await loadScheduledActivityRail(db, userId, projectIds, eventIds);
+  const [helpRail, activityRailItems] = await Promise.all([
+    loadHelpRequestRail(db, userId),
+    loadScheduledActivityRail(db, userId, projectIds, eventIds)
+  ]);
 
   items.sort((a, b) => String(b.createdAt).localeCompare(String(a.createdAt)));
   return {

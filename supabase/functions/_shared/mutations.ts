@@ -17,6 +17,7 @@ import {
 } from './lifecycleGates.ts';
 import { displayStageLabel, nextPhaseIdForProject } from './phases.ts';
 import { recordMeaningfulAction } from './votes.ts';
+import { syncEventScheduleFromLeadingPlan } from './lifecycle.ts';
 
 async function getProjectBySlug(db: SupabaseClient, slug: string) {
   const { data } = await db.from('projects').select('*').eq('slug', slug).maybeSingle();
@@ -182,20 +183,25 @@ export async function createEvent(
   }
 
   if (directToActivity) {
-    const { error: planErr } = await db.from('event_plans').insert({
-      event_id: data.id,
-      title: planTitleValue,
-      description: planDescriptionValue,
-      author_id: userId,
-      demand_consideration_note: '',
-      location_label: body.locationLabel ?? '',
-      location_id: body.locationId ?? body.location_id ?? null,
-      schedule_payload: schedulePayload,
-      plan_payload: planPayload,
-      is_leading: true,
-      status: 'approved'
-    });
+    const { data: planRow, error: planErr } = await db
+      .from('event_plans')
+      .insert({
+        event_id: data.id,
+        title: planTitleValue,
+        description: planDescriptionValue,
+        author_id: userId,
+        demand_consideration_note: '',
+        location_label: body.locationLabel ?? '',
+        location_id: body.locationId ?? body.location_id ?? null,
+        schedule_payload: schedulePayload,
+        plan_payload: planPayload,
+        is_leading: true,
+        status: 'approved'
+      })
+      .select('id')
+      .single();
     if (planErr) throw planErr;
+    await syncEventScheduleFromLeadingPlan(db, data.id, String(planRow.id));
   }
 
   for (const invitee of invitees) {

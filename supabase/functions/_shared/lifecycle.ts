@@ -139,6 +139,36 @@ export async function castProjectPlanVote(
   return { ok: true, ...stats, passed: isPassing(stats, population) };
 }
 
+export async function syncEventScheduleFromLeadingPlan(
+  db: SupabaseClient,
+  eventId: string,
+  planId: string
+) {
+  const { data: plan } = await db
+    .from('event_plans')
+    .select('schedule_payload, location_label, location_id')
+    .eq('id', planId)
+    .maybeSingle();
+  if (!plan) return;
+  const payload = (plan.schedule_payload ?? {}) as Record<string, unknown>;
+  const scheduledAt = String(payload.startAtUtc ?? payload.start_at_utc ?? '').trim();
+  const endsAt = String(payload.endAtUtc ?? payload.end_at_utc ?? '').trim();
+  const update: Record<string, unknown> = {};
+  if (scheduledAt) update.scheduled_at = scheduledAt;
+  if (endsAt) {
+    if (scheduledAt && Date.parse(endsAt) <= Date.parse(scheduledAt)) {
+      throw new Error('ends_at must be after scheduled_at');
+    }
+    update.ends_at = endsAt;
+  }
+  const locationLabel = String(plan.location_label ?? '').trim();
+  if (locationLabel) update.location_label = locationLabel;
+  if (plan.location_id) update.location_id = plan.location_id;
+  if (Object.keys(update).length === 0) return;
+  const { error } = await db.from('events').update(update).eq('id', eventId);
+  if (error) throw error;
+}
+
 export async function castEventPlanVote(
   db: SupabaseClient,
   userId: string,
@@ -154,6 +184,7 @@ export async function castEventPlanVote(
   if (isPassing(stats, population)) {
     await db.from('event_plans').update({ status: 'approved', is_leading: true }).eq('id', planId);
     await db.from('event_plans').update({ is_leading: false }).eq('event_id', event.id).neq('id', planId);
+    await syncEventScheduleFromLeadingPlan(db, event.id, planId);
   } else if (!canStillPass(stats, population)) {
     await db.from('event_plans').update({ status: 'rejected' }).eq('id', planId);
   }
@@ -392,7 +423,13 @@ export async function voteProjectPhaseChange(
   } else if (!canStillPass(stats, population)) {
     await db.from('project_phase_change_requests').update({ status: 'rejected' }).eq('id', requestId);
   }
-  return { ok: true, ...stats, passed: isPassing(stats, population) };
+  const passed = isPassing(stats, population);
+  return {
+    ok: true,
+    ...stats,
+    passed,
+    targetPhaseId: passed ? String(request.target_phase_id) : null
+  };
 }
 
 export async function voteEventPhaseChange(
@@ -450,7 +487,13 @@ export async function voteEventPhaseChange(
   } else if (!canStillPass(stats, population)) {
     await db.from('event_phase_change_requests').update({ status: 'rejected' }).eq('id', requestId);
   }
-  return { ok: true, ...stats, passed: isPassing(stats, population) };
+  const passed = isPassing(stats, population);
+  return {
+    ok: true,
+    ...stats,
+    passed,
+    targetPhaseId: passed ? String(request.target_phase_id) : null
+  };
 }
 
 export async function voteProjectUpdateRequest(

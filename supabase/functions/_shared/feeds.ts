@@ -1341,6 +1341,115 @@ export async function handleFeedPage(
   return pageResult([], limit, offset);
 }
 
+function mapYmdInTz(date: Date, timeZone: string | null) {
+  try {
+    return new Intl.DateTimeFormat('en-CA', {
+      timeZone: timeZone || undefined,
+      year: 'numeric',
+      month: '2-digit',
+      day: '2-digit'
+    }).format(date);
+  } catch {
+    return date.toISOString().slice(0, 10);
+  }
+}
+
+function mapWeekdayInTz(date: Date, timeZone: string | null) {
+  try {
+    const label = new Intl.DateTimeFormat('en-US', {
+      timeZone: timeZone || undefined,
+      weekday: 'short'
+    }).format(date);
+    return ['Sun', 'Mon', 'Tue', 'Wed', 'Thu', 'Fri', 'Sat'].indexOf(label);
+  } catch {
+    return date.getUTCDay();
+  }
+}
+
+function addDaysYmd(ymd: string, days: number) {
+  const date = new Date(`${ymd}T12:00:00.000Z`);
+  date.setUTCDate(date.getUTCDate() + days);
+  return date.toISOString().slice(0, 10);
+}
+
+function includeMapTimestamp(
+  ts: string | null | undefined,
+  opts: {
+    window: string;
+    dateFrom: string | null;
+    dateTo: string | null;
+    upcomingOnly: boolean;
+    timeZone: string | null;
+    enforceUpcoming: boolean;
+  }
+) {
+  if (!ts) {
+    return opts.window === 'all' && !opts.dateFrom && !opts.dateTo;
+  }
+  const millis = Date.parse(ts);
+  if (Number.isNaN(millis)) return true;
+  if (opts.enforceUpcoming && opts.upcomingOnly && millis < Date.now()) return false;
+  if (opts.dateFrom) {
+    const from =
+      opts.dateFrom.length === 10
+        ? Date.parse(`${opts.dateFrom}T00:00:00.000Z`)
+        : Date.parse(opts.dateFrom);
+    if (!Number.isNaN(from) && millis < from) return false;
+  }
+  if (opts.dateTo) {
+    const to =
+      opts.dateTo.length === 10
+        ? Date.parse(`${opts.dateTo}T23:59:59.999Z`)
+        : Date.parse(opts.dateTo);
+    if (!Number.isNaN(to) && millis > to) return false;
+  }
+  if (opts.window === 'all' || opts.window === 'custom') return true;
+  const itemDay = mapYmdInTz(new Date(millis), opts.timeZone);
+  const now = new Date();
+  const today = mapYmdInTz(now, opts.timeZone);
+  if (opts.window === 'today') return itemDay === today;
+  if (opts.window === 'month') return itemDay.slice(0, 7) === today.slice(0, 7);
+  if (opts.window === 'week') {
+    const weekday = mapWeekdayInTz(now, opts.timeZone);
+    const mondayOffset = (weekday + 6) % 7;
+    const weekStart = addDaysYmd(today, -mondayOffset);
+    const weekEnd = addDaysYmd(weekStart, 7);
+    return itemDay >= weekStart && itemDay < weekEnd;
+  }
+  return true;
+}
+
+async function loadMapActivityRoleCounts(
+  db: SupabaseClient,
+  roleTable: string,
+  assignTable: string,
+  activityIds: string[]
+) {
+  const counts = new Map<string, { committed: number; minimum: number }>();
+  if (activityIds.length === 0) return counts;
+  const { data: roles } = await db
+    .from(roleTable)
+    .select('id, activity_id, required_count')
+    .in('activity_id', activityIds);
+  const roleIds = (roles ?? []).map((role) => String(role.id));
+  const { data: assignments } = roleIds.length
+    ? await db.from(assignTable).select('role_id').in('role_id', roleIds)
+    : { data: [] as Array<{ role_id: string }> };
+  const filledByRole = new Map<string, number>();
+  for (const row of assignments ?? []) {
+    const roleId = String(row.role_id);
+    filledByRole.set(roleId, (filledByRole.get(roleId) ?? 0) + 1);
+  }
+  for (const role of roles ?? []) {
+    const activityId = String(role.activity_id);
+    const current = counts.get(activityId) ?? { committed: 0, minimum: 0 };
+    current.minimum += Number(role.required_count ?? 0);
+    current.committed += filledByRole.get(String(role.id)) ?? 0;
+    counts.set(activityId, current);
+  }
+  return counts;
+}
+
 export async function handleMapMarkers(
   db: SupabaseClient,
   userId: string | null,
@@ -1353,7 +1462,21 @@ export async function handleMapMarkers(
     ? Math.min(Math.max(Math.trunc(rawRadius), 1), 20000)
     : 25;
   const filter = params.get('filter') ?? 'all';
+  const windowFilter = (params.get('window') ?? 'all').toLowerCase();
+  const dateFrom = params.get('dateFrom') ?? params.get('date_from');
+  const dateTo = params.get('dateTo') ?? params.get('date_to');
+  const upcomingOnly = !['0', 'false', 'no'].includes(
+    String(params.get('upcomingOnly') ?? params.get('upcoming_only') ?? 'true').toLowerCase()
+  );
+  const timeZone = params.get('tz');
   const markers: unknown[] = [];
+  const scheduleOpts = {
+    window: windowFilter,
+    dateFrom,
+    dateTo,
+    upcomingOnly,
+    timeZone
+  };
 
   const haversine = (aLat: number, aLon: number, bLat: number, bLon: number) => {
     const toRad = (v: number) => (v * Math.PI) / 180;
@@ -1367,6 +1490,10 @@ export async function handleMapMarkers(
   };
 
   if (!Number.isFinite(lat) || !Number.isFinite(lon)) return markers;
+
+  const includeEvents = filter === 'all' || filter === 'events';
+  const includeProjects = filter === 'all' || filter === 'projects';
+  const includeHelp = filter === 'all' || filter === 'help_requests';
 
   const { data: candidateData, error: candidateError } = await db.rpc('get_feed_candidates', {
     p_user_id: userId,
@@ -1387,64 +1514,165 @@ export async function handleMapMarkers(
     candidateRows
       .filter((row) => row.entity_type === entityType)
       .map((row) => String(row.entity_id));
-  const eventIds = idsFor('event');
-  const projectIds = idsFor('project');
-  const helpRequestIds = idsFor('help_request');
+  const eventIds = includeEvents ? idsFor('event') : [];
+  const projectIds = includeProjects ? idsFor('project') : [];
+  const helpRequestIds = includeHelp ? idsFor('help_request') : [];
 
-  const [{ data: events }, { data: projects }, { data: helpRequests }] = await Promise.all([
-    eventIds.length
+  const latDelta = radiusKm / 111;
+  const lonDelta = radiusKm / Math.max(111 * Math.abs(Math.cos((lat * Math.PI) / 180)), 0.01);
+  const [{ data: events }, { data: projects }, { data: helpRequests }, { data: nearbyLocations }] =
+    await Promise.all([
+      eventIds.length
+        ? db
+            .from('events')
+            .select('id, slug, title, location_id, scheduled_at, ends_at')
+            .in('id', eventIds)
+            .not('location_id', 'is', null)
+        : Promise.resolve({ data: [] }),
+      projectIds.length
+        ? db
+            .from('projects')
+            .select('id, slug, title, location_id, project_mode')
+            .in('id', projectIds)
+            .not('location_id', 'is', null)
+        : Promise.resolve({ data: [] }),
+      helpRequestIds.length
+        ? db
+            .from('help_requests')
+            .select('id, title, location_id, needed_at, ends_at')
+            .in('id', helpRequestIds)
+            .not('location_id', 'is', null)
+        : Promise.resolve({ data: [] }),
+      db
+        .from('locations')
+        .select('id, latitude, longitude, precision, display_label, is_online')
+        .eq('is_online', false)
+        .not('latitude', 'is', null)
+        .not('longitude', 'is', null)
+        .gte('latitude', lat - latDelta)
+        .lte('latitude', lat + latDelta)
+        .gte('longitude', lon - lonDelta)
+        .lte('longitude', lon + lonDelta)
+        .limit(400)
+    ]);
+
+  const nearbyLocationIds = (nearbyLocations ?? []).map((row) => String(row.id));
+  const [{ data: eventActivities }, { data: projectActivities }] = await Promise.all([
+    includeEvents && nearbyLocationIds.length
       ? db
-          .from('events')
-          .select('id, slug, title, location_id, scheduled_at, ends_at')
-          .in('id', eventIds)
-          .not('location_id', 'is', null)
+          .from('event_activities')
+          .select('id, title, scheduled_at, ends_at, event_id, location_id')
+          .in('location_id', nearbyLocationIds)
+          .not('scheduled_at', 'is', null)
+          .limit(200)
       : Promise.resolve({ data: [] }),
-    projectIds.length
+    includeProjects && nearbyLocationIds.length
       ? db
-          .from('projects')
-          .select('id, slug, title, location_id')
-          .in('id', projectIds)
-          .not('location_id', 'is', null)
-      : Promise.resolve({ data: [] }),
-    helpRequestIds.length
-      ? db
-          .from('help_requests')
-          .select('id, title, location_id, needed_at, ends_at')
-          .in('id', helpRequestIds)
-          .not('location_id', 'is', null)
+          .from('project_activities')
+          .select('id, title, scheduled_at, ends_at, project_id, location_id')
+          .in('location_id', nearbyLocationIds)
+          .not('scheduled_at', 'is', null)
+          .limit(200)
       : Promise.resolve({ data: [] })
   ]);
+
+  const activityEventIds = [
+    ...new Set((eventActivities ?? []).map((row) => String(row.event_id)).filter(Boolean))
+  ];
+  const activityProjectIds = [
+    ...new Set((projectActivities ?? []).map((row) => String(row.project_id)).filter(Boolean))
+  ];
+  const [{ data: activityEvents }, { data: activityProjects }, eventRoleCounts, projectRoleCounts] =
+    await Promise.all([
+      activityEventIds.length
+        ? db.from('events').select('id, slug, title, is_private').in('id', activityEventIds)
+        : Promise.resolve({ data: [] }),
+      activityProjectIds.length
+        ? db
+            .from('projects')
+            .select('id, slug, title, project_mode, is_closed')
+            .in('id', activityProjectIds)
+            .eq('is_closed', false)
+        : Promise.resolve({ data: [] }),
+      loadMapActivityRoleCounts(
+        db,
+        'event_activity_roles',
+        'event_activity_assignments',
+        (eventActivities ?? []).map((row) => String(row.id))
+      ),
+      loadMapActivityRoleCounts(
+        db,
+        'project_activity_roles',
+        'project_activity_assignments',
+        (projectActivities ?? []).map((row) => String(row.id))
+      )
+    ]);
+  const eventById = new Map((activityEvents ?? []).map((row) => [String(row.id), row]));
+  const projectById = new Map((activityProjects ?? []).map((row) => [String(row.id), row]));
 
   const rows: Array<Record<string, any>> = [
     ...(events ?? []).map((row) => ({
       ...row,
       entityType: 'event',
       slug: row.slug,
-      href: `/events/${row.slug}`
+      href: `/events/${row.slug}`,
+      scheduled_at: row.scheduled_at,
+      ends_at: row.ends_at,
+      enforceUpcoming: true
     })),
     ...(projects ?? []).map((row) => ({
       ...row,
       entityType: 'project',
       slug: row.slug,
-      href: `/projects/${row.slug}`
+      href: `/projects/${row.slug}`,
+      scheduled_at: null,
+      ends_at: null,
+      projectMode: row.project_mode ?? null,
+      enforceUpcoming: false
     })),
     ...(helpRequests ?? []).map((row) => ({
       ...row,
       entityType: 'help_request',
       slug: null,
-      href: `/help-requests/${row.id}`
+      href: `/help-requests/${row.id}`,
+      scheduled_at: row.needed_at,
+      ends_at: row.ends_at,
+      enforceUpcoming: true
     }))
   ];
   const locationIds = [
-    ...new Set(rows.map((row) => String(row.location_id ?? '')).filter(Boolean))
+    ...new Set(
+      [
+        ...rows.map((row) => String(row.location_id ?? '')),
+        ...(eventActivities ?? []).map((row) => String(row.location_id ?? '')),
+        ...(projectActivities ?? []).map((row) => String(row.location_id ?? ''))
+      ].filter(Boolean)
+    )
   ];
-  const { data: locations } = locationIds.length
+  const missingLocationIds = locationIds.filter(
+    (id) => !(nearbyLocations ?? []).some((row) => String(row.id) === id)
+  );
+  const { data: extraLocations } = missingLocationIds.length
     ? await db
         .from('locations')
         .select('id, latitude, longitude, precision, display_label, is_online')
-        .in('id', locationIds)
+        .in('id', missingLocationIds)
     : { data: [] as Array<Record<string, unknown>> };
-  const locationById = new Map((locations ?? []).map((row) => [String(row.id), row]));
+  const locationById = new Map(
+    [...(nearbyLocations ?? []), ...(extraLocations ?? [])].map((row) => [String(row.id), row])
+  );
+
+  const pushMarker = (marker: Record<string, unknown>, scheduledAt: string | null, enforceUpcoming: boolean) => {
+    if (
+      !includeMapTimestamp(scheduledAt, {
+        ...scheduleOpts,
+        enforceUpcoming
+      })
+    ) {
+      return;
+    }
+    markers.push(marker);
+  };
 
   for (const row of rows) {
     const location = locationById.get(String(row.location_id));
@@ -1456,20 +1684,108 @@ export async function handleMapMarkers(
       Number(location.longitude)
     );
     if (distanceKm > radiusKm) continue;
-    markers.push({
-      id: row.id,
-      entityType: row.entityType,
-      slug: row.slug,
-      title: row.title,
-      href: row.href,
-      latitude: Number(location.latitude),
-      longitude: Number(location.longitude),
-      precision: location.precision ?? 'approximate',
-      displayLabel: location.display_label,
-      distanceKm,
-      scheduledAt: row.scheduled_at ?? row.needed_at ?? null,
-      endsAt: row.ends_at ?? null
-    });
+    pushMarker(
+      {
+        id: row.id,
+        entityType: row.entityType,
+        activitySource: null,
+        projectMode: row.projectMode ?? null,
+        slug: row.slug,
+        title: row.title,
+        parentTitle: null,
+        subtitle: null,
+        href: row.href,
+        latitude: Number(location.latitude),
+        longitude: Number(location.longitude),
+        precision: location.precision ?? 'approximate',
+        displayLabel: location.display_label,
+        distanceKm,
+        scheduledAt: row.scheduled_at ?? null,
+        endsAt: row.ends_at ?? null,
+        committedCount: null,
+        minimumParticipants: null
+      },
+      row.scheduled_at ?? null,
+      Boolean(row.enforceUpcoming)
+    );
+  }
+
+  for (const row of eventActivities ?? []) {
+    const parent = eventById.get(String(row.event_id));
+    const location = locationById.get(String(row.location_id));
+    if (!parent || !location?.latitude || !location?.longitude || location.is_online) continue;
+    const distanceKm = haversine(
+      lat,
+      lon,
+      Number(location.latitude),
+      Number(location.longitude)
+    );
+    if (distanceKm > radiusKm) continue;
+    const roles = eventRoleCounts.get(String(row.id));
+    pushMarker(
+      {
+        id: row.id,
+        entityType: 'activity',
+        activitySource: 'event',
+        projectMode: null,
+        slug: parent.slug,
+        title: row.title,
+        parentId: parent.id,
+        parentTitle: parent.title,
+        subtitle: row.title,
+        href: `/events/${parent.slug}?activity=${row.id}`,
+        latitude: Number(location.latitude),
+        longitude: Number(location.longitude),
+        precision: location.precision ?? 'approximate',
+        displayLabel: location.display_label,
+        distanceKm,
+        scheduledAt: row.scheduled_at ?? null,
+        endsAt: row.ends_at ?? null,
+        committedCount: roles?.committed ?? 0,
+        minimumParticipants: roles?.minimum ?? 0
+      },
+      row.scheduled_at ?? null,
+      true
+    );
+  }
+
+  for (const row of projectActivities ?? []) {
+    const parent = projectById.get(String(row.project_id));
+    const location = locationById.get(String(row.location_id));
+    if (!parent || !location?.latitude || !location?.longitude || location.is_online) continue;
+    const distanceKm = haversine(
+      lat,
+      lon,
+      Number(location.latitude),
+      Number(location.longitude)
+    );
+    if (distanceKm > radiusKm) continue;
+    const roles = projectRoleCounts.get(String(row.id));
+    pushMarker(
+      {
+        id: row.id,
+        entityType: 'activity',
+        activitySource: 'project',
+        projectMode: parent.project_mode ?? null,
+        slug: parent.slug,
+        title: row.title,
+        parentId: parent.id,
+        parentTitle: parent.title,
+        subtitle: row.title,
+        href: `/projects/${parent.slug}?activity=${row.id}`,
+        latitude: Number(location.latitude),
+        longitude: Number(location.longitude),
+        precision: location.precision ?? 'approximate',
+        displayLabel: location.display_label,
+        distanceKm,
+        scheduledAt: row.scheduled_at ?? null,
+        endsAt: row.ends_at ?? null,
+        committedCount: roles?.committed ?? 0,
+        minimumParticipants: roles?.minimum ?? 0
+      },
+      row.scheduled_at ?? null,
+      true
+    );
   }
 
   markers.sort(
