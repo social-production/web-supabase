@@ -1332,24 +1332,28 @@ export async function buildProjectLifecycle(
     ? visiblePhases.find((phase) => phase.id === nextPhaseId) ?? null
     : null;
   const usesPlatformVoteContext = Boolean(project.is_platform_tagged);
-  const population = await projectPopulation(db, String(project.id));
+  const [population, signals, phaseOneValues, membershipRes] = await Promise.all([
+    projectPopulation(db, String(project.id)),
+    loadSignalState(db, 'project_signals', 'project_id', String(project.id), userId),
+    hydrateValueImportance(
+      db,
+      'project_values',
+      'project_value_importance_votes',
+      'project_id',
+      String(project.id),
+      userId
+    ),
+    userId
+      ? db
+          .from('project_memberships')
+          .select('is_manager')
+          .eq('project_id', String(project.id))
+          .eq('user_id', userId)
+          .maybeSingle()
+      : Promise.resolve({ data: null })
+  ]);
   const quorumVotesRequired = requiredVotes(Math.max(0, population));
   const voteContextLabel = usesPlatformVoteContext ? 'weekly active users' : 'weekly active members';
-  const signals = await loadSignalState(
-    db,
-    'project_signals',
-    'project_id',
-    String(project.id),
-    userId
-  );
-  const phaseOneValues = await hydrateValueImportance(
-    db,
-    'project_values',
-    'project_value_importance_votes',
-    'project_id',
-    String(project.id),
-    userId
-  );
   const prominentValues = phaseOneValues
     .filter((v: { importanceScore?: number }) => Number(v.importanceScore ?? 0) >= 5)
     .map((v: { id: string; label: string }) => ({ id: v.id, label: v.label }));
@@ -1382,40 +1386,30 @@ export async function buildProjectLifecycle(
       label: phase.title
     })
   );
-  const phaseChangeRequests = await hydrateProjectPhaseChangeRequests(
-    db,
-    String(project.id),
-    userId,
-    population
-  );
-  const revertHistory = await hydrateProjectRevertHistory(db, String(project.id));
+  const viewerMembership = membershipRes.data;
+  const viewerIsManager =
+    Boolean(userId) &&
+    (String(project.author_id ?? '') === userId || Boolean(viewerMembership?.is_manager));
   const isSoftware =
     String(project.project_subtype ?? '') === 'software' ||
     String((winningPlan as Record<string, unknown> | null)?.projectSubtype ?? '') === 'software' ||
     Boolean((winningPlan as Record<string, unknown> | null)?.repositoryUrl);
-  const softwareGovernance = isSoftware
-    ? await hydrateSoftwareGovernance(db, project, userId, viewerIsMember, population)
-    : null;
-  const { data: viewerMembership } = userId
-    ? await db
-        .from('project_memberships')
-        .select('is_manager')
-        .eq('project_id', String(project.id))
-        .eq('user_id', userId)
-        .maybeSingle()
-    : { data: null };
-  const viewerIsManager =
-    Boolean(userId) &&
-    (String(project.author_id ?? '') === userId || Boolean(viewerMembership?.is_manager));
-  const requestSystem = await hydrateProjectRequestSystem(
-    db,
-    String(project.id),
-    userId,
-    viewerIsMember,
-    viewerIsManager,
-    projectMode,
-    population
-  );
+  const [phaseChangeRequests, revertHistory, requestSystem, softwareGovernance] = await Promise.all([
+    hydrateProjectPhaseChangeRequests(db, String(project.id), userId, population),
+    hydrateProjectRevertHistory(db, String(project.id)),
+    hydrateProjectRequestSystem(
+      db,
+      String(project.id),
+      userId,
+      viewerIsMember,
+      viewerIsManager,
+      projectMode,
+      population
+    ),
+    isSoftware
+      ? hydrateSoftwareGovernance(db, project, userId, viewerIsMember, population)
+      : Promise.resolve(null)
+  ]);
 
   return {
     projectMode,
@@ -1534,18 +1528,20 @@ export async function buildEventLifecycle(
   const next = EVENT_PHASES.find((p) => p.order === currentOrder + 1) ?? null;
   const previous = EVENT_PHASES.find((p) => p.order === currentOrder - 1) ?? null;
   const usesPlatformVoteContext = await isPlatformEvent(db, String(event.id));
-  const population = await eventPopulation(db, String(event.id));
+  const [population, signals, phaseOneValues] = await Promise.all([
+    eventPopulation(db, String(event.id)),
+    loadSignalState(db, 'event_signals', 'event_id', String(event.id), userId),
+    hydrateValueImportance(
+      db,
+      'event_values',
+      'event_value_importance_votes',
+      'event_id',
+      String(event.id),
+      userId
+    )
+  ]);
   const quorumVotesRequired = requiredVotes(Math.max(0, population));
   const voteContextLabel = usesPlatformVoteContext ? 'weekly active users' : 'weekly active members';
-  const signals = await loadSignalState(db, 'event_signals', 'event_id', String(event.id), userId);
-  const phaseOneValues = await hydrateValueImportance(
-    db,
-    'event_values',
-    'event_value_importance_votes',
-    'event_id',
-    String(event.id),
-    userId
-  );
   const prominentValues = phaseOneValues
     .filter((v: { importanceScore?: number }) => Number(v.importanceScore ?? 0) >= 5)
     .map((v: { id: string; label: string }) => ({ id: v.id, label: v.label }));
@@ -2189,6 +2185,23 @@ export async function buildLinksFrame(
     conversionNote,
     conversionWorkflow,
     conversionLineage
+  };
+}
+
+export function emptyLinksFrame(ownerKind: 'project' | 'event', ownerSlug: string) {
+  return {
+    ownerKind,
+    ownerSlug,
+    intro: '',
+    activeLinks: [],
+    pendingLinkRequests: [],
+    historicalLinks: [],
+    historicalLinkRequests: [],
+    linkableRecords: [],
+    viewerCanProposeLinks: false,
+    conversionNote: '',
+    conversionWorkflow: [],
+    conversionLineage: null
   };
 }
 

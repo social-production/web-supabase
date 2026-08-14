@@ -32,6 +32,7 @@ import {
   buildEventLifecycle,
   buildLinksFrame,
   buildProjectLifecycle,
+  emptyLinksFrame,
   hydrateActivities,
   hydrateEventEditRequests,
   hydrateEventHistory,
@@ -45,7 +46,7 @@ import { isEventMember, isProjectMember, loadEntityTags, canViewEntity, canViewP
 import { persistBodyTags, extractSlugs, TagError } from '../_shared/tags.ts';
 import { reverseGeocodeExternal, searchPlacesExternal, clientIpFromRequest, ipLocationHintExternal } from '../_shared/geocoding.ts';
 import { loadActiveReport, moderationFieldsFromRow } from '../_shared/moderation.ts';
-import { recordMeaningfulAction } from '../_shared/votes.ts';
+import { recordMeaningfulAction, projectPopulation, eventPopulation } from '../_shared/votes.ts';
 
 // Re-export viewer vote helper via a light local call using service client after handlers load.
 async function viewerActiveVote(
@@ -644,7 +645,8 @@ async function handleRequest(
     // Projects / events / help requests — detail reads with access gates
     if (req.method === 'GET' && path.startsWith('/projects/')) {
       const slug = decodeURIComponent(path.slice('/projects/'.length).split('/')[0]);
-      if (req.method === 'GET' && !path.slice(`/projects/${slug}`.length)) {
+      const rest = path.slice(`/projects/${slug}`.length);
+      if (rest === '/history' || rest === '/links' || !rest) {
         const { data } = await db
           .from('projects')
           .select('*, users!fk_projects_author_id_users(username)')
@@ -652,11 +654,21 @@ async function handleRequest(
           .maybeSingle();
         if (!data) return error('not_found', 404);
         if (!(await canViewEntity(db, userId, 'project', data.id))) return error('not_found', 404);
-        const author = Array.isArray(data.users) ? data.users[0] : data.users;
         const viewerIsMember = userId ? await isProjectMember(db, data.id, userId) : false;
-        const [tags, comments, activities, projectReport, activeVote] = await Promise.all([
+        if (rest === '/history') {
+          const population = await projectPopulation(db, String(data.id));
+          return json({
+            history: await hydrateProjectHistory(db, data.id, userId, population, viewerIsMember)
+          });
+        }
+        if (rest === '/links') {
+          return json({
+            linksFrame: await buildLinksFrame(db, 'project', data, viewerIsMember, userId)
+          });
+        }
+        const author = Array.isArray(data.users) ? data.users[0] : data.users;
+        const [tags, activities, projectReport, activeVote] = await Promise.all([
           loadEntityTags(db, 'project', data.id),
-          handleGetComments(db, userId, 'project', data.id),
           hydrateActivities(db, 'project', data.id, userId),
           loadActiveReport(db, 'project', data.id, userId),
           viewerActiveVote(db, userId, 'project', data.id)
@@ -669,14 +681,7 @@ async function handleRequest(
           activities
         );
         const population = Number(projectLifecycle.voteContextPopulation ?? data.member_count ?? 0);
-        const [
-          updatesRes,
-          updateRequests,
-          editRequests,
-          linksFrame,
-          history,
-          membersRes
-        ] = await Promise.all([
+        const [updatesRes, updateRequests, editRequests, membersRes] = await Promise.all([
           db
             .from('project_updates')
             .select(
@@ -686,8 +691,6 @@ async function handleRequest(
             .order('created_at', { ascending: false }),
           hydrateProjectUpdateRequests(db, data.id, userId, population),
           hydrateProjectEditRequests(db, data.id, userId, population),
-          buildLinksFrame(db, 'project', data, viewerIsMember, userId),
-          hydrateProjectHistory(db, data.id, userId, population, viewerIsMember),
           db
             .from('project_memberships')
             .select('user_id, users!fk_project_memberships_user_id_users(id, username, profile_image_url)')
@@ -731,9 +734,9 @@ async function handleRequest(
           editRequests,
           viewerCanRequestEdit: Boolean(userId),
           viewerCanVoteOnEditRequests: Boolean(userId),
-          linksFrame,
+          linksFrame: emptyLinksFrame('project', String(data.slug)),
           inventoryFrame: null,
-          history,
+          history: [],
           members: (membersRes.data ?? []).map((m) => {
             const u = Array.isArray(m.users) ? m.users[0] : m.users;
             return {
@@ -752,7 +755,7 @@ async function handleRequest(
           isUnderReview: projectModeration.isUnderReview,
           moderationState: projectModeration.moderationState,
           discussionNote: '',
-          discussion: comments
+          discussion: []
         });
       }
     }
@@ -803,7 +806,8 @@ async function handleRequest(
 
     if (req.method === 'GET' && path.startsWith('/events/')) {
       const slug = decodeURIComponent(path.slice('/events/'.length).split('/')[0]);
-      if (path === `/events/${slug}`) {
+      const rest = path.slice(`/events/${slug}`.length);
+      if (rest === '/history' || rest === '/links' || !rest) {
         const { data } = await db
           .from('events')
           .select('*, users!fk_events_created_by_users(username)')
@@ -811,11 +815,39 @@ async function handleRequest(
           .maybeSingle();
         if (!data) return error('not_found', 404);
         if (!(await canViewEntity(db, userId, 'event', data.id))) return error('not_found', 404);
-        const author = Array.isArray(data.users) ? data.users[0] : data.users;
-        const tags = await loadEntityTags(db, 'event', data.id);
-        const comments = await handleGetComments(db, userId, 'event', data.id);
         const viewerIsMember = userId ? await isEventMember(db, data.id, userId) : false;
-        const activities = await hydrateActivities(db, 'event', data.id, userId);
+        if (rest === '/history') {
+          const population = await eventPopulation(db, String(data.id));
+          return json({
+            history: await hydrateEventHistory(
+              db,
+              data.id,
+              userId,
+              population,
+              viewerIsMember,
+              String(data.governance) === 'organizer_controlled'
+            )
+          });
+        }
+        if (rest === '/links') {
+          return json({
+            linksFrame: await buildLinksFrame(db, 'event', data, viewerIsMember, userId)
+          });
+        }
+        const author = Array.isArray(data.users) ? data.users[0] : data.users;
+        const [tags, activities, eventReport, editorsRes, membersRes] = await Promise.all([
+          loadEntityTags(db, 'event', data.id),
+          hydrateActivities(db, 'event', data.id, userId),
+          loadActiveReport(db, 'event', data.id, userId),
+          db
+            .from('event_editors')
+            .select('user_id, users!fk_event_editors_user_id_users(username, profile_image_url)')
+            .eq('event_id', data.id),
+          db
+            .from('event_memberships')
+            .select('user_id, users!fk_event_memberships_user_id_users(id, username, profile_image_url)')
+            .eq('event_id', data.id)
+        ]);
         const eventLifecycle = await buildEventLifecycle(
           db,
           data,
@@ -823,7 +855,6 @@ async function handleRequest(
           viewerIsMember,
           activities
         );
-        const eventReport = await loadActiveReport(db, 'event', data.id, userId);
         const eventModeration = moderationFieldsFromRow(data, eventReport);
         let homeCommunity = null;
         if (data.home_community_id) {
@@ -836,11 +867,7 @@ async function handleRequest(
             homeCommunity = { id: community.id, slug: community.slug, name: community.name };
           }
         }
-        const { data: editors } = await db
-          .from('event_editors')
-          .select('user_id, users!fk_event_editors_user_id_users(username, profile_image_url)')
-          .eq('event_id', data.id);
-        const eventEditors = (editors ?? []).map((row) => {
+        const eventEditors = (editorsRes.data ?? []).map((row) => {
           const u = Array.isArray(row.users) ? row.users[0] : row.users;
           return {
             id: row.user_id,
@@ -848,21 +875,36 @@ async function handleRequest(
             profileImageUrl: u?.profile_image_url ?? null
           };
         });
-        const members = ((await db.from('event_memberships').select('user_id, users!fk_event_memberships_user_id_users(id, username, profile_image_url)').eq('event_id', data.id)).data ?? []).map((m) => {
+        const members = (membersRes.data ?? []).map((m) => {
           const u = Array.isArray(m.users) ? m.users[0] : m.users;
-          return { id: u?.id ?? m.user_id, username: u?.username ?? 'unknown', profileImageUrl: u?.profile_image_url ?? null };
+          return {
+            id: u?.id ?? m.user_id,
+            username: u?.username ?? 'unknown',
+            profileImageUrl: u?.profile_image_url ?? null
+          };
         });
         const invitedUsernames =
           data.audience === 'invite_only'
-            ? members
-                .filter((m) => m.id !== data.created_by)
-                .map((m) => m.username)
+            ? members.filter((m) => m.id !== data.created_by).map((m) => m.username)
             : [];
         const viewerIsOrganizer =
           Boolean(userId) &&
           (data.created_by === userId || eventEditors.some((e) => e.id === userId));
         const viewerHasEventEditAccess =
           String(data.governance) === 'organizer_controlled' ? viewerIsOrganizer : viewerIsMember;
+        const population = Number(eventLifecycle.voteContextPopulation ?? data.member_count ?? 0);
+        const [activeVote, updatesRes, updateRequests, editRequests] = await Promise.all([
+          viewerActiveVote(db, userId, 'event', data.id),
+          db
+            .from('event_updates')
+            .select(
+              'id, title, body, created_at, author_id, users!fk_event_updates_author_id_users(username)'
+            )
+            .eq('event_id', data.id)
+            .order('created_at', { ascending: false }),
+          hydrateEventUpdateRequests(db, data.id, userId, population),
+          hydrateEventEditRequests(db, data.id, userId, population)
+        ]);
         return json({
           id: data.id,
           slug: data.slug,
@@ -880,7 +922,7 @@ async function handleRequest(
           endsAt: data.ends_at,
           timeLabel: data.time_label ?? data.scheduled_at ?? '',
           voteCount: data.vote_count ?? 0,
-          activeVote: await viewerActiveVote(db, userId, 'event', data.id),
+          activeVote,
           signalCount: eventLifecycle.phaseOne.signalSummary?.totalCount ?? 0,
           signalSummary: eventLifecycle.phaseOne.signalSummary,
           commentCount: data.comment_count ?? 0,
@@ -891,7 +933,7 @@ async function handleRequest(
           lifecycle: eventLifecycle,
           attendanceNote: '',
           agenda: [],
-          updates: ((await db.from('event_updates').select('id, title, body, created_at, author_id, users!fk_event_updates_author_id_users(username)').eq('event_id', data.id).order('created_at', { ascending: false })).data ?? []).map((u) => {
+          updates: (updatesRes.data ?? []).map((u) => {
             const updateAuthor = Array.isArray(u.users) ? u.users[0] : u.users;
             return {
               id: u.id,
@@ -901,31 +943,14 @@ async function handleRequest(
               createdAt: u.created_at
             };
           }),
-          updateRequests: await hydrateEventUpdateRequests(
-            db,
-            data.id,
-            userId,
-            Number(eventLifecycle.voteContextPopulation ?? data.member_count ?? 0)
-          ),
+          updateRequests,
           viewerCanRequestUpdate: Boolean(userId),
           viewerCanVoteOnUpdateRequests: Boolean(userId),
-          editRequests: await hydrateEventEditRequests(
-            db,
-            data.id,
-            userId,
-            Number(eventLifecycle.voteContextPopulation ?? data.member_count ?? 0)
-          ),
+          editRequests,
           viewerCanRequestEdit: Boolean(userId),
           viewerCanVoteOnEditRequests: Boolean(userId),
-          linksFrame: await buildLinksFrame(db, 'event', data, viewerIsMember, userId),
-          history: await hydrateEventHistory(
-            db,
-            data.id,
-            userId,
-            Number(eventLifecycle.voteContextPopulation ?? data.member_count ?? 0),
-            viewerIsMember,
-            String(data.governance) === 'organizer_controlled'
-          ),
+          linksFrame: emptyLinksFrame('event', String(data.slug)),
+          history: [],
           attendees: [],
           invitedUsernames,
           eventEditors,
@@ -944,7 +969,7 @@ async function handleRequest(
           isUnderReview: eventModeration.isUnderReview,
           moderationState: eventModeration.moderationState,
           discussionNote: '',
-          discussion: comments
+          discussion: []
         });
       }
     }
