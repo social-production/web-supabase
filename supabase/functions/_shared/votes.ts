@@ -54,7 +54,24 @@ export function canStillPass(stats: VoteStats, population: number): boolean {
   return maxYes / maxTotal >= MIN_APPROVAL_RATIO;
 }
 
+const WEEKLY_ACTIVE_TTL_MS = 30_000;
+const POPULATION_TTL_MS = 15_000;
+
+type CacheEntry<T> = { value: T; expiresAt: number };
+
+let weeklyActiveCache: CacheEntry<number> | null = null;
+const populationCache = new Map<string, CacheEntry<number>>();
+
+function readCache<T>(entry: CacheEntry<T> | undefined | null): T | null {
+  if (!entry || Date.now() >= entry.expiresAt) {
+    return null;
+  }
+  return entry.value;
+}
+
 export async function weeklyActiveCount(db: SupabaseClient): Promise<number> {
+  const cached = readCache(weeklyActiveCache);
+  if (cached != null) return cached;
   const weekAgo = new Date(Date.now() - 7 * 24 * 3600 * 1000).toISOString();
   const [{ data: actions }, { data: votes }, { data: comments }] = await Promise.all([
     db.from('meaningful_actions').select('user_id').gte('occurred_at', weekAgo),
@@ -71,19 +88,26 @@ export async function weeklyActiveCount(db: SupabaseClient): Promise<number> {
   for (const row of comments ?? []) {
     if (row.author_id) ids.add(String(row.author_id));
   }
-  return ids.size;
+  const value = ids.size;
+  weeklyActiveCache = { value, expiresAt: Date.now() + WEEKLY_ACTIVE_TTL_MS };
+  return value;
 }
 
 export async function projectPopulation(db: SupabaseClient, projectId: string): Promise<number> {
+  const cacheKey = `project:${projectId}`;
+  const cached = readCache(populationCache.get(cacheKey));
+  if (cached != null) return cached;
   const { data: project } = await db
     .from('projects')
     .select('is_platform_tagged')
     .eq('id', projectId)
     .maybeSingle();
   // Platform-tagged: N = platform weekly actives, then requiredVotes(N).
-  if (project?.is_platform_tagged) return weeklyActiveCount(db);
-  // Non-platform: N = weekly unique actives within project membership, then requiredVotes(N).
-  return weeklyActiveProjectMembers(db, projectId);
+  const value = project?.is_platform_tagged
+    ? await weeklyActiveCount(db)
+    : await weeklyActiveProjectMembers(db, projectId);
+  populationCache.set(cacheKey, { value, expiresAt: Date.now() + POPULATION_TTL_MS });
+  return value;
 }
 
 async function weeklyActiveProjectMembers(db: SupabaseClient, projectId: string): Promise<number> {
@@ -130,9 +154,15 @@ async function weeklyActiveEventMembers(db: SupabaseClient, eventId: string): Pr
 }
 
 export async function eventPopulation(db: SupabaseClient, eventId: string): Promise<number> {
+  const cacheKey = `event:${eventId}`;
+  const cached = readCache(populationCache.get(cacheKey));
+  if (cached != null) return cached;
   // Platform-tagged: N = platform weekly actives. Else N = weekly actives within event membership.
-  if (await isPlatformEvent(db, eventId)) return weeklyActiveCount(db);
-  return weeklyActiveEventMembers(db, eventId);
+  const value = (await isPlatformEvent(db, eventId))
+    ? await weeklyActiveCount(db)
+    : await weeklyActiveEventMembers(db, eventId);
+  populationCache.set(cacheKey, { value, expiresAt: Date.now() + POPULATION_TTL_MS });
+  return value;
 }
 
 export async function recordMeaningfulAction(

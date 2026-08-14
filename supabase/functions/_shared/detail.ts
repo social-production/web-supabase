@@ -1681,13 +1681,20 @@ async function hydrateOpenRequests(
     db,
     (rows ?? []).map((r) => r.author_id as string | null)
   );
+  const requestIds = (rows ?? []).map((r) => r.id as string);
+  const { data: voteRows } = requestIds.length
+    ? await db.from(voteTable).select('request_id, vote, voter_id').in('request_id', requestIds)
+    : { data: [] as Array<{ request_id: string; vote: unknown; voter_id: string | null }> };
+  const votesByRequest = new Map<string, Array<{ vote: unknown; voter_id: string | null }>>();
+  for (const vote of voteRows ?? []) {
+    const list = votesByRequest.get(String(vote.request_id)) ?? [];
+    list.push(vote);
+    votesByRequest.set(String(vote.request_id), list);
+  }
   const out: Array<Record<string, unknown>> = [];
   for (const req of rows ?? []) {
-    const { data: votes } = await db
-      .from(voteTable)
-      .select('vote, voter_id')
-      .eq('request_id', req.id);
-    const summary = voteSummaryPayload(votes ?? [], viewerId, population);
+    const votes = votesByRequest.get(String(req.id)) ?? [];
+    const summary = voteSummaryPayload(votes, viewerId, population);
     const payload: Record<string, unknown> = {
       id: req.id,
       authorUsername: names.get(String(req.author_id)) ?? 'unknown',
