@@ -429,7 +429,7 @@ export async function commitHelpRole(
 ) {
   const { data: role } = await db
     .from('help_request_roles')
-    .select('id, help_request_id, slots')
+    .select('id, help_request_id, title, slots')
     .eq('id', roleId)
     .maybeSingle();
   if (!role || role.help_request_id !== helpRequestId) throw new Error('not_found');
@@ -459,6 +459,27 @@ export async function commitHelpRole(
       role_id: roleId,
       user_id: userId
     });
+
+    const { data: helpRequest } = await db
+      .from('help_requests')
+      .select('id, author_id, title')
+      .eq('id', helpRequestId)
+      .maybeSingle();
+    if (helpRequest?.author_id && helpRequest.author_id !== userId) {
+      await db.from('notifications').insert({
+        recipient_id: helpRequest.author_id,
+        actor_id: userId,
+        kind: 'hr-role-signup',
+        surface: 'public',
+        subject_type: 'help-request',
+        subject_id: helpRequestId,
+        target_id: roleId,
+        title: String(helpRequest.title ?? ''),
+        body: `Someone signed up for the "${String(role.title ?? 'role')}" role.`,
+        href: `/help-requests/${helpRequestId}`,
+        is_unread: true
+      });
+    }
   } else {
     await db
       .from('help_request_role_assignments')

@@ -1,24 +1,45 @@
 /**
  * Bootstrap activity-rail builder for hosted Supabase.
- * Focused on active governance votes the viewer can cast on membership surfaces.
+ * Governance votes plus help requests the viewer owns, signed up for, or sees in member scopes.
  */
 import type { SupabaseClient } from 'https://esm.sh/@supabase/supabase-js@2.49.1';
 import { measureServerSpan } from './performance.ts';
 
+type HelpRequestKind = 'help-request-owned' | 'help-request-signup' | 'help-request-open';
+
 type RailItem = {
   id: string;
   subjectId: string;
-  kind: 'vote';
+  kind: 'vote' | 'project' | 'event' | HelpRequestKind;
   title: string;
   href: string;
   meta: string;
   createdAt: string;
   countLabel?: string;
-  voteEntityKind: 'project' | 'event';
-  voteKindLabel: string;
-  voteTargetId: string;
+  timeLabel?: string;
+  body?: string;
+  viewerIsAuthor?: boolean;
+  viewerParticipated?: boolean;
+  voteEntityKind?: 'project' | 'event';
+  voteKindLabel?: string;
+  voteTargetId?: string;
   voteSubKind?: 'criterion' | 'overall';
   planPhaseId?: 'phase-2' | 'phase-3';
+  projectMode?: string;
+  projectSlug?: string;
+  eventSlug?: string;
+  activityId?: string;
+  scheduledAt?: string;
+  endsAt?: string;
+};
+
+type HelpRequestRow = {
+  id: string;
+  title: string;
+  body: string | null;
+  needed_at: string;
+  schedule_label: string | null;
+  ends_at: string | null;
 };
 
 function voteHref(
@@ -68,6 +89,446 @@ function viewerAlreadyVoted(
   userId: string
 ) {
   return Boolean(rows?.some((row) => row.voter_id === userId));
+}
+
+function truncateBody(body: string, limit = 200) {
+  const text = body.trim();
+  if (text.length <= limit) return text;
+  return `${text.slice(0, limit).trimEnd()}…`;
+}
+
+function helpRequestStillOpen(row: { needed_at?: string | null; ends_at?: string | null }) {
+  if (row.ends_at) return new Date(row.ends_at).getTime() > Date.now();
+  return true;
+}
+
+function helpRequestEnded(row: { ends_at?: string | null }) {
+  return Boolean(row.ends_at) && new Date(String(row.ends_at)).getTime() <= Date.now();
+}
+
+function helpCountLabel(signed: number, needed: number) {
+  return needed > 0 ? `${signed} signed up · ${needed} needed` : `${signed} signed up`;
+}
+
+async function loadHelpRoleSummaries(db: SupabaseClient, helpRequestIds: string[]) {
+  const summaries = new Map<string, { signed: number; needed: number }>();
+  if (helpRequestIds.length === 0) return summaries;
+  const { data: roles } = await db
+    .from('help_request_roles')
+    .select('id, help_request_id, slots')
+    .in('help_request_id', helpRequestIds);
+  const roleIds = (roles ?? []).map((role) => String(role.id));
+  const { data: assignments } = roleIds.length
+    ? await db.from('help_request_role_assignments').select('role_id').in('role_id', roleIds)
+    : { data: [] as Array<{ role_id: string }> };
+  const filledByRole = new Map<string, number>();
+  for (const row of assignments ?? []) {
+    const roleId = String(row.role_id);
+    filledByRole.set(roleId, (filledByRole.get(roleId) ?? 0) + 1);
+  }
+  for (const role of roles ?? []) {
+    const helpRequestId = String(role.help_request_id);
+    const current = summaries.get(helpRequestId) ?? { signed: 0, needed: 0 };
+    current.needed += Number(role.slots ?? 0);
+    current.signed += filledByRole.get(String(role.id)) ?? 0;
+    summaries.set(helpRequestId, current);
+  }
+  return summaries;
+}
+
+function toHelpRailItem(
+  row: HelpRequestRow,
+  kind: HelpRequestKind,
+  summary: { signed: number; needed: number } | undefined,
+  extra: Partial<RailItem> = {}
+): RailItem {
+  const neededAt = String(row.needed_at);
+  return {
+    id: kind === 'help-request-open' ? `open-${row.id}` : String(row.id),
+    subjectId: String(row.id),
+    kind,
+    title: String(row.title),
+    href: `/help-requests/${row.id}`,
+    meta: extra.meta ?? '',
+    createdAt: neededAt,
+    timeLabel: String(row.schedule_label || neededAt),
+    countLabel: helpCountLabel(summary?.signed ?? 0, summary?.needed ?? 0),
+    body: truncateBody(String(row.body ?? '')),
+    ...extra
+  };
+}
+
+async function loadHelpRequestRail(
+  db: SupabaseClient,
+  userId: string
+): Promise<{ activityRail: RailItem[]; activityRailHistory: RailItem[] }> {
+  const items: RailItem[] = [];
+  const history: RailItem[] = [];
+  const ownedIds = new Set<string>();
+  const signedUpIds = new Set<string>();
+
+  const { data: authoredRows } = await db
+    .from('help_requests')
+    .select('id, title, body, needed_at, schedule_label, ends_at')
+    .eq('author_id', userId)
+    .order('needed_at', { ascending: true })
+    .limit(16);
+  const authored = (authoredRows ?? []) as HelpRequestRow[];
+  const authoredIds = authored.map((row) => String(row.id));
+  const authoredSummaries = await loadHelpRoleSummaries(db, authoredIds);
+  for (const row of authored) {
+    ownedIds.add(String(row.id));
+    const summary = authoredSummaries.get(String(row.id));
+    if (helpRequestStillOpen(row)) {
+      items.push(
+        toHelpRailItem(row, 'help-request-owned', summary, {
+          meta: 'Your request',
+          viewerIsAuthor: true
+        })
+      );
+    } else if (helpRequestEnded(row)) {
+      history.push(
+        toHelpRailItem(row, 'help-request-owned', summary, {
+          meta: 'Your request',
+          viewerIsAuthor: true,
+          viewerParticipated: true
+        })
+      );
+    }
+  }
+
+  const { data: assignmentRows } = await db
+    .from('help_request_role_assignments')
+    .select('role_id')
+    .eq('user_id', userId);
+  const assignedRoleIds = [...new Set((assignmentRows ?? []).map((row) => String(row.role_id)))];
+  if (assignedRoleIds.length > 0) {
+    const { data: assignedRoles } = await db
+      .from('help_request_roles')
+      .select('help_request_id')
+      .in('id', assignedRoleIds);
+    const signupIds = [
+      ...new Set((assignedRoles ?? []).map((row) => String(row.help_request_id)))
+    ].filter((id) => !ownedIds.has(id));
+    if (signupIds.length > 0) {
+      const { data: signupRows } = await db
+        .from('help_requests')
+        .select('id, title, body, needed_at, schedule_label, ends_at')
+        .in('id', signupIds)
+        .order('needed_at', { ascending: true })
+        .limit(16);
+      const signups = (signupRows ?? []) as HelpRequestRow[];
+      const signupSummaries = await loadHelpRoleSummaries(
+        db,
+        signups.map((row) => String(row.id))
+      );
+      for (const row of signups) {
+        signedUpIds.add(String(row.id));
+        const summary = signupSummaries.get(String(row.id));
+        if (helpRequestStillOpen(row)) {
+          items.push(
+            toHelpRailItem(row, 'help-request-signup', summary, { meta: 'You signed up' })
+          );
+        } else if (helpRequestEnded(row)) {
+          history.push(
+            toHelpRailItem(row, 'help-request-signup', summary, {
+              meta: 'You signed up',
+              viewerParticipated: true
+            })
+          );
+        }
+      }
+    }
+  }
+
+  const { data: memberships } = await db
+    .from('scope_memberships')
+    .select('scope_kind, scope_id')
+    .eq('user_id', userId);
+  const memberChannelIds = (memberships ?? [])
+    .filter((row) => row.scope_kind === 'channel' && row.scope_id)
+    .map((row) => String(row.scope_id));
+  const memberCommunityIds = (memberships ?? [])
+    .filter((row) => row.scope_kind === 'community' && row.scope_id)
+    .map((row) => String(row.scope_id));
+
+  const taggedIds = new Set<string>();
+  if (memberChannelIds.length > 0) {
+    const { data: channelTags } = await db
+      .from('help_request_tags')
+      .select('help_request_id')
+      .in('channel_id', memberChannelIds);
+    for (const row of channelTags ?? []) taggedIds.add(String(row.help_request_id));
+  }
+  if (memberCommunityIds.length > 0) {
+    const { data: communityTags } = await db
+      .from('help_request_tags')
+      .select('help_request_id')
+      .in('community_id', memberCommunityIds);
+    for (const row of communityTags ?? []) taggedIds.add(String(row.help_request_id));
+  }
+
+  const openCandidateIds = [...taggedIds].filter(
+    (id) => !ownedIds.has(id) && !signedUpIds.has(id)
+  );
+  if (openCandidateIds.length > 0) {
+    const { data: openRows } = await db
+      .from('help_requests')
+      .select('id, title, body, needed_at, schedule_label, ends_at')
+      .in('id', openCandidateIds)
+      .order('needed_at', { ascending: true })
+      .limit(16);
+    const openHelp = ((openRows ?? []) as HelpRequestRow[]).filter(helpRequestStillOpen).slice(0, 6);
+    const openSummaries = await loadHelpRoleSummaries(
+      db,
+      openHelp.map((row) => String(row.id))
+    );
+    for (const row of openHelp) {
+      items.push(toHelpRailItem(row, 'help-request-open', openSummaries.get(String(row.id))));
+    }
+  }
+
+  items.sort((a, b) => String(a.createdAt).localeCompare(String(b.createdAt)));
+  history.sort((a, b) => String(b.createdAt).localeCompare(String(a.createdAt)));
+  return {
+    activityRail: items.slice(0, 12),
+    activityRailHistory: history.slice(0, 10)
+  };
+}
+
+type ActivityParent = {
+  id: string;
+  slug: string;
+  title: string;
+  project_mode?: string | null;
+};
+
+type ActivityRow = {
+  id: string;
+  title: string;
+  scheduled_at: string;
+  ends_at: string | null;
+  project_id?: string;
+  event_id?: string;
+};
+
+async function loadActivityRoleSummaries(
+  db: SupabaseClient,
+  roleTable: string,
+  assignTable: string,
+  activityIds: string[]
+) {
+  const summaries = new Map<string, { signed: number; needed: number }>();
+  if (activityIds.length === 0) return summaries;
+  const { data: roles } = await db
+    .from(roleTable)
+    .select('id, activity_id, required_count')
+    .in('activity_id', activityIds);
+  const roleIds = (roles ?? []).map((role) => String(role.id));
+  const { data: assignments } = roleIds.length
+    ? await db.from(assignTable).select('role_id').in('role_id', roleIds)
+    : { data: [] as Array<{ role_id: string }> };
+  const filledByRole = new Map<string, number>();
+  for (const row of assignments ?? []) {
+    const roleId = String(row.role_id);
+    filledByRole.set(roleId, (filledByRole.get(roleId) ?? 0) + 1);
+  }
+  for (const role of roles ?? []) {
+    const activityId = String(role.activity_id);
+    const current = summaries.get(activityId) ?? { signed: 0, needed: 0 };
+    current.needed += Number(role.required_count ?? 0);
+    current.signed += filledByRole.get(String(role.id)) ?? 0;
+    summaries.set(activityId, current);
+  }
+  return summaries;
+}
+
+async function loadViewerAssignedActivityIds(
+  db: SupabaseClient,
+  userId: string,
+  roleTable: string,
+  assignTable: string,
+  activityIds: string[]
+) {
+  const assigned = new Set<string>();
+  if (activityIds.length === 0) return assigned;
+  const { data: roles } = await db.from(roleTable).select('id, activity_id').in('activity_id', activityIds);
+  const roleIds = (roles ?? []).map((role) => String(role.id));
+  if (roleIds.length === 0) return assigned;
+  const { data: assignments } = await db
+    .from(assignTable)
+    .select('role_id')
+    .eq('user_id', userId)
+    .in('role_id', roleIds);
+  const assignedRoles = new Set((assignments ?? []).map((row) => String(row.role_id)));
+  for (const role of roles ?? []) {
+    if (assignedRoles.has(String(role.id))) assigned.add(String(role.activity_id));
+  }
+  return assigned;
+}
+
+function toActivityRailItem(
+  row: ActivityRow,
+  parent: ActivityParent,
+  kind: 'project' | 'event',
+  summary: { signed: number; needed: number } | undefined,
+  extra: Partial<RailItem> = {}
+): RailItem {
+  const scheduledAt = String(row.scheduled_at);
+  const endsAt = row.ends_at ? String(row.ends_at) : scheduledAt;
+  const slug = parent.slug;
+  const surface = kind === 'project' ? 'projects' : 'events';
+  return {
+    kind,
+    id: String(row.id),
+    subjectId: slug,
+    title: String(row.title),
+    href: `/${surface}/${slug}?activity=${row.id}`,
+    meta: parent.title,
+    createdAt: scheduledAt,
+    scheduledAt,
+    endsAt,
+    countLabel: extra.countLabel ?? helpCountLabel(summary?.signed ?? 0, summary?.needed ?? 0),
+    activityId: String(row.id),
+    ...(kind === 'project'
+      ? { projectSlug: slug, projectMode: String(parent.project_mode ?? 'productive') }
+      : { eventSlug: slug }),
+    ...extra
+  };
+}
+
+async function loadScheduledActivityRail(
+  db: SupabaseClient,
+  userId: string,
+  projectIds: string[],
+  eventIds: string[]
+): Promise<{ activityRail: RailItem[]; activityRailHistory: RailItem[] }> {
+  const nowIso = new Date().toISOString();
+  const items: RailItem[] = [];
+  const history: RailItem[] = [];
+
+  if (projectIds.length > 0) {
+    const { data: projects } = await db
+      .from('projects')
+      .select('id, slug, title, project_mode, current_phase_id, is_closed')
+      .in('id', projectIds);
+    const parentById = new Map((projects ?? []).map((row) => [String(row.id), row as ActivityParent]));
+    const activeProjectIds = (projects ?? [])
+      .filter((row) => !row.is_closed && row.current_phase_id === 'phase-5')
+      .map((row) => String(row.id));
+    if (activeProjectIds.length > 0) {
+      const { data: activities } = await db
+        .from('project_activities')
+        .select('id, title, scheduled_at, ends_at, project_id')
+        .in('project_id', activeProjectIds)
+        .gt('ends_at', nowIso)
+        .order('scheduled_at', { ascending: true })
+        .limit(8);
+      const rows = (activities ?? []) as ActivityRow[];
+      const summaries = await loadActivityRoleSummaries(
+        db,
+        'project_activity_roles',
+        'project_activity_assignments',
+        rows.map((row) => String(row.id))
+      );
+      for (const row of rows) {
+        const parent = parentById.get(String(row.project_id));
+        if (!parent) continue;
+        items.push(toActivityRailItem(row, parent, 'project', summaries.get(String(row.id))));
+      }
+    }
+
+    const { data: pastActivities } = await db
+      .from('project_activities')
+      .select('id, title, scheduled_at, ends_at, project_id')
+      .in('project_id', projectIds)
+      .lte('ends_at', nowIso)
+      .order('ends_at', { ascending: false })
+      .limit(20);
+    const pastRows = (pastActivities ?? []) as ActivityRow[];
+    const assigned = await loadViewerAssignedActivityIds(
+      db,
+      userId,
+      'project_activity_roles',
+      'project_activity_assignments',
+      pastRows.map((row) => String(row.id))
+    );
+    for (const row of pastRows) {
+      const parent = parentById.get(String(row.project_id));
+      if (!parent) continue;
+      history.push(
+        toActivityRailItem(row, parent, 'project', undefined, {
+          countLabel: undefined,
+          viewerParticipated: assigned.has(String(row.id))
+        })
+      );
+    }
+  }
+
+  if (eventIds.length > 0) {
+    const { data: events } = await db
+      .from('events')
+      .select('id, slug, title, current_phase_id')
+      .in('id', eventIds);
+    const parentById = new Map((events ?? []).map((row) => [String(row.id), row as ActivityParent]));
+    const activeEventIds = (events ?? [])
+      .filter((row) => row.current_phase_id === 'event-plan' || row.current_phase_id === 'activity')
+      .map((row) => String(row.id));
+    if (activeEventIds.length > 0) {
+      const { data: activities } = await db
+        .from('event_activities')
+        .select('id, title, scheduled_at, ends_at, event_id')
+        .in('event_id', activeEventIds)
+        .gt('ends_at', nowIso)
+        .order('scheduled_at', { ascending: true })
+        .limit(8);
+      const rows = (activities ?? []) as ActivityRow[];
+      const summaries = await loadActivityRoleSummaries(
+        db,
+        'event_activity_roles',
+        'event_activity_assignments',
+        rows.map((row) => String(row.id))
+      );
+      for (const row of rows) {
+        const parent = parentById.get(String(row.event_id));
+        if (!parent) continue;
+        items.push(toActivityRailItem(row, parent, 'event', summaries.get(String(row.id))));
+      }
+    }
+
+    const { data: pastActivities } = await db
+      .from('event_activities')
+      .select('id, title, scheduled_at, ends_at, event_id')
+      .in('event_id', eventIds)
+      .lte('ends_at', nowIso)
+      .order('ends_at', { ascending: false })
+      .limit(20);
+    const pastRows = (pastActivities ?? []) as ActivityRow[];
+    const assigned = await loadViewerAssignedActivityIds(
+      db,
+      userId,
+      'event_activity_roles',
+      'event_activity_assignments',
+      pastRows.map((row) => String(row.id))
+    );
+    for (const row of pastRows) {
+      const parent = parentById.get(String(row.event_id));
+      if (!parent) continue;
+      history.push(
+        toActivityRailItem(row, parent, 'event', undefined, {
+          countLabel: undefined,
+          viewerParticipated: assigned.has(String(row.id))
+        })
+      );
+    }
+  }
+
+  items.sort((a, b) => String(a.createdAt).localeCompare(String(b.createdAt)));
+  history.sort((a, b) => String(b.endsAt ?? b.createdAt).localeCompare(String(a.endsAt ?? a.createdAt)));
+  return {
+    activityRail: items.slice(0, 8),
+    activityRailHistory: history.slice(0, 20)
+  };
 }
 
 async function buildActivityRailImpl(
@@ -637,10 +1098,13 @@ async function buildActivityRailImpl(
     }
   }
 
+  const helpRail = await loadHelpRequestRail(db, userId);
+  const activityRailItems = await loadScheduledActivityRail(db, userId, projectIds, eventIds);
+
   items.sort((a, b) => String(b.createdAt).localeCompare(String(a.createdAt)));
   return {
-    activityRail: items.slice(0, 24),
-    activityRailHistory: []
+    activityRail: [...activityRailItems.activityRail, ...helpRail.activityRail, ...items.slice(0, 24)],
+    activityRailHistory: [...activityRailItems.activityRailHistory, ...helpRail.activityRailHistory]
   };
 }
 
