@@ -717,7 +717,10 @@ export async function handleGetSettings(db: SupabaseClient, userId: string) {
     requireFollowApproval: data.require_follow_approval,
     preferredLanguage: data.preferred_language === 'nl' ? 'nl' : 'en',
     displayTimezone: data.display_timezone ?? null,
-    defaultLocationId: data.default_location_id ?? null
+    defaultLocationId: data.default_location_id ?? null,
+    notificationCategories: Array.isArray(data.notification_categories)
+      ? data.notification_categories
+      : ['follows', 'comments', 'shares_invites', 'roles', 'votes_needed', 'phase_done']
   };
 }
 
@@ -741,6 +744,7 @@ export async function handleUpdateSettings(
     preferredLanguage: 'preferred_language',
     displayTimezone: 'display_timezone',
     defaultLocationId: 'default_location_id',
+    notificationCategories: 'notification_categories',
     requireFollowApproval: 'require_follow_approval',
     hidePublicActivityFromPersonalFeeds: 'hide_public_activity_from_personal_feeds',
     hidePersonalFeedFromNonFollowers: 'hide_personal_feed_from_non_followers',

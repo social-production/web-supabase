@@ -312,7 +312,8 @@ export async function voteProjectValueImportance(
   valueId: string,
   importance: unknown
 ) {
-  await governedProjectForMember(db, slug, userId);
+  const project = await governedProjectForMember(db, slug, userId);
+  if (String(project.current_phase_id) !== 'phase-1') throw new Error('wrong_phase');
   const value = Math.max(1, Math.min(10, Number(importance) || 0));
   if (value < 1) throw new Error('invalid_importance');
   const { error } = await db.from('project_value_importance_votes').upsert(
@@ -334,7 +335,8 @@ export async function voteEventValueImportance(
   valueId: string,
   importance: unknown
 ) {
-  await getEvent(db, slug);
+  const event = await getEvent(db, slug);
+  if (String(event.current_phase_id) !== 'proposal') throw new Error('wrong_phase');
   const value = Math.max(1, Math.min(10, Number(importance) || 0));
   if (value < 1) throw new Error('invalid_importance');
   const { error } = await db.from('event_value_importance_votes').upsert(

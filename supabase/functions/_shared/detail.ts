@@ -254,7 +254,7 @@ const SHARED_RUBRIC = [
   },
   {
     id: 'rubric:demand-response',
-    label: 'Does this plan respond well to the current demand signal?'
+    label: 'Does this plan respond well to the current support signal?'
   },
   { id: 'rubric:achievability', label: 'Does this plan seem realistically achievable?' },
   { id: 'rubric:stages-coherent', label: 'Are the stages coherent and in a sensible order?' }
@@ -1484,20 +1484,20 @@ export async function buildProjectLifecycle(
         population,
         usesPlatformVoteContext
       ),
-      viewerCanAddValue: viewerIsMember,
-      viewerCanVoteOnValues: viewerIsMember
+      viewerCanAddValue: viewerIsMember && currentPhaseId === 'phase-1',
+      viewerCanVoteOnValues: viewerIsMember && currentPhaseId === 'phase-1'
     },
     phaseTwo: {
       plans: productionPlans,
       winningPlanId: productionWinning,
-      viewerCanSubmitPlans: viewerIsMember,
+      viewerCanSubmitPlans: viewerIsMember && currentPhaseId === 'phase-2',
       viewerCanVoteOnPlans: viewerIsMember,
       availableAssetManagementServices: []
     },
     phaseThree: {
       plans: distributionPlans,
       winningPlanId: distributionWinning,
-      viewerCanSubmitPlans: viewerIsMember,
+      viewerCanSubmitPlans: viewerIsMember && currentPhaseId === 'phase-3',
       viewerCanVoteOnPlans: viewerIsMember,
       requestSystemEnabled: false
     },
@@ -1592,9 +1592,9 @@ export async function buildEventLifecycle(
     }),
     phaseOne: {
       values: phaseOneValues,
-      viewerCanSignalDemand: Boolean(userId) && currentPhaseId === 'proposal',
+      viewerCanSignalDemand: Boolean(userId) && currentPhaseId !== 'closed' && !isOrganizerControlled,
       viewerHasDemandSignal: signals.viewerSignal === 'demand',
-      viewerCanSignalOpposition: Boolean(userId) && currentPhaseId === 'proposal',
+      viewerCanSignalOpposition: Boolean(userId) && currentPhaseId !== 'closed' && !isOrganizerControlled,
       viewerHasOppositionSignal: signals.viewerSignal === 'opposition',
       signalSummary: emptySignalSummary(
         signals.supportCount,

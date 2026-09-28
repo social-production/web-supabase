@@ -101,11 +101,19 @@ async function loadRatedPlanIds(
   return rated;
 }
 
-function viewerAlreadyVoted(
+function viewerCastVote(
   rows: Array<{ vote?: string | number | null; voter_id?: string }> | undefined,
   userId: string
 ) {
-  return Boolean(rows?.some((row) => row.voter_id === userId));
+  const row = rows?.find((entry) => entry.voter_id === userId);
+  if (!row) return null;
+  return String(row.vote ?? '');
+}
+
+function rememberCastVote(history: RailItem[], seen: Set<string>, item: RailItem) {
+  if (seen.has(item.id)) return;
+  seen.add(item.id);
+  history.push({ ...item, meta: '', viewerParticipated: true });
 }
 
 function truncateBody(body: string, limit = 200) {
@@ -431,7 +439,7 @@ async function loadScheduledActivityRail(
       .in('id', projectIds);
     const parentById = new Map((projects ?? []).map((row) => [String(row.id), row as ActivityParent]));
     const activeProjectIds = (projects ?? [])
-      .filter((row) => !row.is_closed)
+      .filter((row) => !row.is_closed && row.current_phase_id === 'phase-5')
       .map((row) => String(row.id));
     if (activeProjectIds.length > 0) {
       const { data: activities } = await db
@@ -448,10 +456,27 @@ async function loadScheduledActivityRail(
         'project_activity_assignments',
         rows.map((row) => String(row.id))
       );
+      const assignedUpcoming = await loadViewerAssignedActivityIds(
+        db,
+        userId,
+        'project_activity_roles',
+        'project_activity_assignments',
+        rows.map((row) => String(row.id))
+      );
       for (const row of rows) {
         const parent = parentById.get(String(row.project_id));
         if (!parent) continue;
         items.push(toActivityRailItem(row, parent, 'project', summaries.get(String(row.id))));
+        if (assignedUpcoming.has(String(row.id))) {
+          history.push(
+            toActivityRailItem(row, parent, 'project', summaries.get(String(row.id)), {
+              id: `signup-project-activity-${row.id}`,
+              countLabel: undefined,
+              meta: `You signed up · ${parent.title}`,
+              viewerParticipated: true
+            })
+          );
+        }
       }
     }
 
@@ -489,7 +514,7 @@ async function loadScheduledActivityRail(
       .in('id', eventIds);
     const parentById = new Map((events ?? []).map((row) => [String(row.id), row as ActivityParent]));
     const activeEventIds = (events ?? [])
-      .filter((row) => row.current_phase_id === 'event-plan' || row.current_phase_id === 'activity')
+      .filter((row) => row.current_phase_id === 'activity')
       .map((row) => String(row.id));
     if (activeEventIds.length > 0) {
       const { data: activities } = await db
@@ -506,10 +531,27 @@ async function loadScheduledActivityRail(
         'event_activity_assignments',
         rows.map((row) => String(row.id))
       );
+      const assignedUpcoming = await loadViewerAssignedActivityIds(
+        db,
+        userId,
+        'event_activity_roles',
+        'event_activity_assignments',
+        rows.map((row) => String(row.id))
+      );
       for (const row of rows) {
         const parent = parentById.get(String(row.event_id));
         if (!parent) continue;
         items.push(toActivityRailItem(row, parent, 'event', summaries.get(String(row.id))));
+        if (assignedUpcoming.has(String(row.id))) {
+          history.push(
+            toActivityRailItem(row, parent, 'event', summaries.get(String(row.id)), {
+              id: `signup-event-activity-${row.id}`,
+              countLabel: undefined,
+              meta: `You signed up · ${parent.title}`,
+              viewerParticipated: true
+            })
+          );
+        }
       }
     }
 
@@ -557,6 +599,8 @@ async function buildActivityRailImpl(
   }
 
   const items: RailItem[] = [];
+  const castVoteHistory: RailItem[] = [];
+  const castVoteSeen = new Set<string>();
   const limit = 8;
 
   const [{ data: projectMemberships }, { data: eventMemberships }] = await Promise.all([
@@ -612,9 +656,25 @@ async function buildActivityRailImpl(
 
     // Phase-change votes
     for (const req of phaseRequests ?? []) {
-      if (viewerAlreadyVoted(phaseVotes.get(String(req.id)), userId)) continue;
       const project = projectById.get(String(req.project_id));
       if (!project) continue;
+      const cast = viewerCastVote(phaseVotes.get(String(req.id)), userId);
+      if (cast !== null) {
+        rememberCastVote(castVoteHistory, castVoteSeen, {
+          id: `vote-project-phase-${req.id}`,
+          subjectId: String(project.id),
+          kind: 'vote',
+          title: `Phase change: ${project.title}`,
+          href: voteHref('projects', String(project.slug), 'phase_change', String(req.id)),
+          meta: '',
+          createdAt: String(req.created_at),
+          voteEntityKind: 'project',
+          voteKindLabel: 'phase_change',
+          voteTargetId: String(req.id),
+          viewerParticipated: true
+        });
+        continue;
+      }
       const tallies = summarizeRows(phaseVotes.get(String(req.id)) ?? []);
       items.push({
         id: String(req.id),
@@ -633,9 +693,25 @@ async function buildActivityRailImpl(
 
     // Update votes
     for (const req of updateRequests ?? []) {
-      if (viewerAlreadyVoted(updateVotes.get(String(req.id)), userId)) continue;
       const project = projectById.get(String(req.project_id));
       if (!project) continue;
+      const cast = viewerCastVote(updateVotes.get(String(req.id)), userId);
+      if (cast !== null) {
+        rememberCastVote(castVoteHistory, castVoteSeen, {
+          id: `vote-project-update-${req.id}`,
+          subjectId: String(project.id),
+          kind: 'vote',
+          title: `Update: ${project.title}`,
+          href: voteHref('projects', String(project.slug), 'update', String(req.id)),
+          meta: '',
+          createdAt: String(req.created_at),
+          voteEntityKind: 'project',
+          voteKindLabel: 'update',
+          voteTargetId: String(req.id),
+          viewerParticipated: true
+        });
+        continue;
+      }
       const tallies = summarizeRows(updateVotes.get(String(req.id)) ?? []);
       items.push({
         id: String(req.id),
@@ -654,9 +730,25 @@ async function buildActivityRailImpl(
 
     // Edit votes
     for (const req of editRequests ?? []) {
-      if (viewerAlreadyVoted(editVotes.get(String(req.id)), userId)) continue;
       const project = projectById.get(String(req.project_id));
       if (!project) continue;
+      const cast = viewerCastVote(editVotes.get(String(req.id)), userId);
+      if (cast !== null) {
+        rememberCastVote(castVoteHistory, castVoteSeen, {
+          id: `vote-project-edit-${req.id}`,
+          subjectId: String(project.id),
+          kind: 'vote',
+          title: `Edit: ${project.title}`,
+          href: voteHref('projects', String(project.slug), 'edit', String(req.id)),
+          meta: '',
+          createdAt: String(req.created_at),
+          voteEntityKind: 'project',
+          voteKindLabel: 'edit',
+          voteTargetId: String(req.id),
+          viewerParticipated: true
+        });
+        continue;
+      }
       const tallies = summarizeRows(editVotes.get(String(req.id)) ?? []);
       items.push({
         id: String(req.id),
@@ -691,9 +783,25 @@ async function buildActivityRailImpl(
         loadRatedPlanIds(db, 'project_plan_criterion_ratings', planIds, userId)
       ]);
       for (const plan of plans ?? []) {
-        if (viewerAlreadyVoted(planVotes.get(String(plan.id)), userId)) continue;
         const project = projectById.get(String(plan.project_id));
         if (!project) continue;
+        const cast = viewerCastVote(planVotes.get(String(plan.id)), userId);
+        if (cast !== null) {
+          rememberCastVote(castVoteHistory, castVoteSeen, {
+            id: `vote-project-plan-${plan.id}`,
+            subjectId: String(project.id),
+            kind: 'vote',
+            title: String(plan.title ?? project.title),
+            href: voteHref('projects', String(project.slug), 'plan', String(plan.id)),
+            meta: '',
+            createdAt: String(plan.created_at),
+            voteEntityKind: 'project',
+            voteKindLabel: 'plan',
+            voteTargetId: String(plan.id),
+            viewerParticipated: true
+          });
+          continue;
+        }
         const tallies = summarizeRows(planVotes.get(String(plan.id)) ?? []);
         const planPhaseId =
           project.current_phase_id === 'phase-3' ? ('phase-3' as const) : ('phase-2' as const);
@@ -767,9 +875,25 @@ async function buildActivityRailImpl(
     ]);
 
     for (const req of phaseRequests ?? []) {
-      if (viewerAlreadyVoted(phaseVotes.get(String(req.id)), userId)) continue;
       const event = eventById.get(String(req.event_id));
       if (!event) continue;
+      const cast = viewerCastVote(phaseVotes.get(String(req.id)), userId);
+      if (cast !== null) {
+        rememberCastVote(castVoteHistory, castVoteSeen, {
+          id: `vote-event-phase-${req.id}`,
+          subjectId: String(event.id),
+          kind: 'vote',
+          title: `Phase change: ${event.title}`,
+          href: voteHref('events', String(event.slug), 'phase_change', String(req.id)),
+          meta: '',
+          createdAt: String(req.created_at),
+          voteEntityKind: 'event',
+          voteKindLabel: 'phase_change',
+          voteTargetId: String(req.id),
+          viewerParticipated: true
+        });
+        continue;
+      }
       const tallies = summarizeRows(phaseVotes.get(String(req.id)) ?? []);
       items.push({
         id: String(req.id),
@@ -787,9 +911,25 @@ async function buildActivityRailImpl(
     }
 
     for (const req of updateRequests ?? []) {
-      if (viewerAlreadyVoted(updateVotes.get(String(req.id)), userId)) continue;
       const event = eventById.get(String(req.event_id));
       if (!event) continue;
+      const cast = viewerCastVote(updateVotes.get(String(req.id)), userId);
+      if (cast !== null) {
+        rememberCastVote(castVoteHistory, castVoteSeen, {
+          id: `vote-event-update-${req.id}`,
+          subjectId: String(event.id),
+          kind: 'vote',
+          title: `Update: ${event.title}`,
+          href: voteHref('events', String(event.slug), 'update', String(req.id)),
+          meta: '',
+          createdAt: String(req.created_at),
+          voteEntityKind: 'event',
+          voteKindLabel: 'update',
+          voteTargetId: String(req.id),
+          viewerParticipated: true
+        });
+        continue;
+      }
       const tallies = summarizeRows(updateVotes.get(String(req.id)) ?? []);
       items.push({
         id: String(req.id),
@@ -807,9 +947,25 @@ async function buildActivityRailImpl(
     }
 
     for (const req of editRequests ?? []) {
-      if (viewerAlreadyVoted(editVotes.get(String(req.id)), userId)) continue;
       const event = eventById.get(String(req.event_id));
       if (!event) continue;
+      const cast = viewerCastVote(editVotes.get(String(req.id)), userId);
+      if (cast !== null) {
+        rememberCastVote(castVoteHistory, castVoteSeen, {
+          id: `vote-event-edit-${req.id}`,
+          subjectId: String(event.id),
+          kind: 'vote',
+          title: `Edit: ${event.title}`,
+          href: voteHref('events', String(event.slug), 'edit', String(req.id)),
+          meta: '',
+          createdAt: String(req.created_at),
+          voteEntityKind: 'event',
+          voteKindLabel: 'edit',
+          voteTargetId: String(req.id),
+          viewerParticipated: true
+        });
+        continue;
+      }
       const tallies = summarizeRows(editVotes.get(String(req.id)) ?? []);
       items.push({
         id: String(req.id),
@@ -843,9 +999,25 @@ async function buildActivityRailImpl(
         loadRatedPlanIds(db, 'event_plan_criterion_ratings', planIds, userId)
       ]);
       for (const plan of plans ?? []) {
-        if (viewerAlreadyVoted(planVotes.get(String(plan.id)), userId)) continue;
         const event = eventById.get(String(plan.event_id));
         if (!event) continue;
+        const cast = viewerCastVote(planVotes.get(String(plan.id)), userId);
+        if (cast !== null) {
+          rememberCastVote(castVoteHistory, castVoteSeen, {
+            id: `vote-event-plan-${plan.id}`,
+            subjectId: String(event.id),
+            kind: 'vote',
+            title: String(plan.title ?? event.title),
+            href: voteHref('events', String(event.slug), 'plan', String(plan.id)),
+            meta: '',
+            createdAt: String(plan.created_at),
+            voteEntityKind: 'event',
+            voteKindLabel: 'plan',
+            voteTargetId: String(plan.id),
+            viewerParticipated: true
+          });
+          continue;
+        }
         const tallies = summarizeRows(planVotes.get(String(plan.id)) ?? []);
         const voteSubKind = ratedPlanIds.has(String(plan.id)) ? ('overall' as const) : ('criterion' as const);
         items.push({
@@ -978,12 +1150,31 @@ async function buildActivityRailImpl(
       const tallies = talliesByRequest.get(String(req.id)) ?? { yes: 0, no: 0 };
 
       for (const scope of scopes) {
-        if (
-          viewerAlreadyVoted(
-            votesByRequestScope.get(`${req.id}:${scope.voteScope}`),
-            userId
-          )
-        ) {
+        const cast = viewerCastVote(
+          votesByRequestScope.get(`${req.id}:${scope.voteScope}`),
+          userId
+        );
+        if (cast !== null) {
+          const subject =
+            scope.entityKind === 'project'
+              ? projectMeta.get(scope.entityId)
+              : eventMeta.get(scope.entityId);
+          if (subject) {
+            const surface = scope.entityKind === 'project' ? 'projects' : 'events';
+            rememberCastVote(castVoteHistory, castVoteSeen, {
+              id: `vote-link-${req.id}-${scope.voteScope}`,
+              subjectId: String(subject.slug),
+              kind: 'vote',
+              title: String(subject.title),
+              href: `/${surface}/${subject.slug}?tab=links&linkRequest=${req.id}`,
+              meta: '',
+              createdAt: String(req.created_at),
+              voteEntityKind: scope.entityKind,
+              voteKindLabel: requestType === 'sever' ? 'link_sever' : 'link',
+              voteTargetId: String(req.id),
+              viewerParticipated: true
+            });
+          }
           continue;
         }
         const subject =
@@ -1069,7 +1260,23 @@ async function buildActivityRailImpl(
         });
         continue;
       }
-      if (viewerAlreadyVoted(prVotes.get(String(pr.id)), userId)) continue;
+      const prCast = viewerCastVote(prVotes.get(String(pr.id)), userId);
+      if (prCast !== null) {
+        rememberCastVote(castVoteHistory, castVoteSeen, {
+          id: `vote-pull-request-${pr.id}`,
+          subjectId: String(project.id),
+          kind: 'vote',
+          title: `Pull request: ${project.title}`,
+          href: voteHref('projects', String(project.slug), 'pull_request', String(pr.id)),
+          meta: '',
+          createdAt: String(pr.created_at),
+          voteEntityKind: 'project',
+          voteKindLabel: 'pull_request',
+          voteTargetId: String(pr.id),
+          viewerParticipated: true
+        });
+        continue;
+      }
       const tallies = summarizeRows(prVotes.get(String(pr.id)) ?? []);
       items.push({
         id: String(pr.id),
@@ -1096,9 +1303,25 @@ async function buildActivityRailImpl(
     const mergeReqIds = (mergeRequests ?? []).map((r) => String(r.id));
     const mergeVotes = await loadVoteMap(db, 'project_merge_capability_change_votes', mergeReqIds);
     for (const req of mergeRequests ?? []) {
-      if (viewerAlreadyVoted(mergeVotes.get(String(req.id)), userId)) continue;
       const project = projectById.get(String(req.project_id));
       if (!project) continue;
+      const cast = viewerCastVote(mergeVotes.get(String(req.id)), userId);
+      if (cast !== null) {
+        rememberCastVote(castVoteHistory, castVoteSeen, {
+          id: `vote-merge-capability-${req.id}`,
+          subjectId: String(project.id),
+          kind: 'vote',
+          title: `Merge capability: ${project.title}`,
+          href: voteHref('projects', String(project.slug), 'merge_capability', String(req.id)),
+          meta: '',
+          createdAt: String(req.created_at),
+          voteEntityKind: 'project',
+          voteKindLabel: 'merge_capability',
+          voteTargetId: String(req.id),
+          viewerParticipated: true
+        });
+        continue;
+      }
       const tallies = summarizeRows(mergeVotes.get(String(req.id)) ?? []);
       items.push({
         id: String(req.id),
@@ -1125,9 +1348,25 @@ async function buildActivityRailImpl(
     const repoReqIds = (repoRequests ?? []).map((r) => String(r.id));
     const repoVotes = await loadVoteMap(db, 'project_repository_replacement_votes', repoReqIds);
     for (const req of repoRequests ?? []) {
-      if (viewerAlreadyVoted(repoVotes.get(String(req.id)), userId)) continue;
       const project = projectById.get(String(req.project_id));
       if (!project) continue;
+      const cast = viewerCastVote(repoVotes.get(String(req.id)), userId);
+      if (cast !== null) {
+        rememberCastVote(castVoteHistory, castVoteSeen, {
+          id: `vote-repository-${req.id}`,
+          subjectId: String(project.id),
+          kind: 'vote',
+          title: `Repository: ${project.title}`,
+          href: voteHref('projects', String(project.slug), 'repository_replacement', String(req.id)),
+          meta: '',
+          createdAt: String(req.created_at),
+          voteEntityKind: 'project',
+          voteKindLabel: 'repository_replacement',
+          voteTargetId: String(req.id),
+          viewerParticipated: true
+        });
+        continue;
+      }
       const tallies = summarizeRows(repoVotes.get(String(req.id)) ?? []);
       items.push({
         id: String(req.id),
@@ -1153,7 +1392,11 @@ async function buildActivityRailImpl(
   items.sort((a, b) => String(b.createdAt).localeCompare(String(a.createdAt)));
   return {
     activityRail: [...activityRailItems.activityRail, ...helpRail.activityRail, ...items.slice(0, 24)],
-    activityRailHistory: [...activityRailItems.activityRailHistory, ...helpRail.activityRailHistory]
+    activityRailHistory: [
+      ...activityRailItems.activityRailHistory,
+      ...helpRail.activityRailHistory,
+      ...castVoteHistory
+    ].slice(0, 40)
   };
 }
 

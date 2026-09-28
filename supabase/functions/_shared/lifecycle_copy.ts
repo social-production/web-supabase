@@ -15,15 +15,15 @@ const DEFAULT_PROJECT_PHASE_COPY: Record<string, PhaseCopy> = {
     mechanics: [
       'Members propose values that describe outcomes the project should optimize for.',
       "Everyone rates each value's importance on a 1–10 scale; ratings above 50% carry into later planning.",
-      'Demand and opposition signals show whether enough members want the project to move forward.',
-      "Advancement unlocks when demand meets the quorum threshold for this project's vote context."
+      'Support and opposition signals show whether enough members want the project to move forward.',
+      "Advancement unlocks when support meets the quorum threshold for this project's vote context."
     ]
   },
   'phase-2': {
     summary: 'Turn agreed values into a concrete production or operations plan.',
     mechanics: [
       'Members submit plans that explain how the project will be built, run, or delivered.',
-      'Each plan must respond to the current demand signal and address high-importance values.',
+      'Each plan must respond to the current support signal and address high-importance values.',
       'Plans are voted on value-by-value and as a whole until one plan clears the approval threshold.',
       'The winning plan becomes the reference for activity scheduling and later phases.'
     ]
@@ -62,7 +62,7 @@ const COLLECTIVE_SERVICE_OVERRIDES: Record<string, PhaseCopy> = {
     summary: 'Define how the collective service will operate day to day.',
     mechanics: [
       'Submit operations plans covering staffing, scheduling, and how the service runs.',
-      'Explain how the plan meets current demand and each high-importance value.',
+      'Explain how the plan meets current support and each high-importance value.',
       'Members vote on value fit and overall approval until one plan leads.',
       'The winning operations plan drives activity templates and request handling.'
     ]
@@ -104,16 +104,16 @@ const DEFAULT_EVENT_PHASE_COPY: Record<string, PhaseCopy> = {
     summary: 'Gather interest and define the values this event should optimize for.',
     mechanics: [
       'Members propose values and rate their importance; scores above 50% feed into planning.',
-      'Demand signals show whether enough people want the event to proceed.',
+      'Support signals show whether enough people want the event to proceed.',
       'Editors and members align on scope before detailed plans are submitted.',
-      "Advance when demand and value agreement meet the event's thresholds."
+      "Advance when support and value agreement meet the event's thresholds."
     ]
   },
   'event-plan': {
     summary: 'Propose schedules, locations, and staged plans for the event.',
     mechanics: [
       'Members submit event plans with dates, times, location, and staged activities.',
-      'Each plan must explain how it responds to demand and high-importance values.',
+      'Each plan must explain how it responds to support and high-importance values.',
       'Plans are voted on per value and overall until one clears approval.',
       'The winning plan sets the live event title, schedule, and activity calendar bounds.'
     ]

@@ -509,6 +509,7 @@ export async function addProjectValue(db: SupabaseClient, userId: string, slug: 
         : 'forbidden'
     );
   }
+  if (String(project.current_phase_id) !== 'phase-1') throw new Error('wrong_phase');
   await db.from('project_values').insert({
     project_id: project.id,
     label,
@@ -520,6 +521,7 @@ export async function addProjectValue(db: SupabaseClient, userId: string, slug: 
 export async function addEventValue(db: SupabaseClient, userId: string, slug: string, label: string) {
   const event = await getEventBySlug(db, slug);
   if (!event) throw new Error('not_found');
+  if (String(event.current_phase_id) !== 'proposal') throw new Error('wrong_phase');
   await db.from('event_values').insert({
     event_id: event.id,
     label,
@@ -865,7 +867,18 @@ export async function addProjectProductionPlan(
   }
   const rawPhase = String(input.phase ?? input.phaseKind ?? input.phase_kind ?? 'production');
   const phaseKind =
-    rawPhase === 'distribution' ? 'distribution' : rawPhase === 'organisation' ? 'organisation' : 'production';
+    rawPhase === 'distribution'
+      ? 'distribution'
+      : rawPhase === 'access'
+        ? 'access'
+        : rawPhase === 'organisation'
+          ? 'organisation'
+          : 'production';
+  const requiredPhase =
+    phaseKind === 'distribution' || phaseKind === 'access' ? 'phase-3' : 'phase-2';
+  if (String(project.current_phase_id) !== requiredPhase) {
+    throw new Error('wrong_phase');
+  }
   const { data, error } = await db
     .from('project_plans')
     .insert({
@@ -936,6 +949,9 @@ export async function addEventPlan(
 ) {
   const event = await getEventBySlug(db, slug);
   if (!event) throw new Error('not_found');
+  if (String(event.current_phase_id) !== 'event-plan') {
+    throw new Error('wrong_phase');
+  }
   const schedulePayload =
     (input.schedule as Record<string, unknown> | undefined) ??
     (input.schedulePayload as Record<string, unknown> | undefined) ??
